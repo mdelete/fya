@@ -34,10 +34,10 @@ objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSData",
 objc2-app-kit = { version = "0.3", features = ["NSOpenPanel", "NSSavePanel", "NSApplication", "NSImage", "NSResponder", "NSWorkspace"] }
 dispatch2 = "0.3"
 
-[profile.release]
-opt-level = "s"
-lto = true
-codegen-units = 1
+#[profile.release]
+#opt-level = "s"
+#lto = true
+#codegen-units = 1
 
 # Windows: Icon + Metadaten in die .exe einbetten (siehe build.rs)
 [target.'cfg(windows)'.build-dependencies]

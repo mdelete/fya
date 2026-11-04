@@ -67,7 +67,7 @@ install -Dm644 linux/fya.desktop ~/.local/share/applications/fya.desktop
 Windows: aktuelles stable Rust mit MSVC-Toolchain (Visual Studio Build Tools, „Desktop development
 with C++“). Dann `cargo build --release` → `target\release\fya.exe` (mit eingebettetem Icon, ohne
 Konsolenfenster). Daten liegen unter `%APPDATA%\fya\`. Die CI (`.github/workflows/windows.yml`) baut
-die .exe bei jedem Push und legt sie als Artefakt ab. Beim Cross-Kompilieren von macOS/Linux
+die .exe aber auch auf Anfrage über Actions. Beim Cross-Kompilieren von macOS/Linux
 (`--target x86_64-pc-windows-gnu`, benötigt mingw-w64 (brew install mingw-w64)) wird das Icon nicht eingebettet.
 
 ## Bedienung

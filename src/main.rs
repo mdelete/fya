@@ -185,6 +185,9 @@ enum Message {
     PaneResized(pane_grid::ResizeEvent),
     ShowView(View),
     SelectMbAlbum(usize),
+    /// Album in der Compilations-Ansicht (None = alle)
+    SelectCompAlbum(Option<i64>),
+    CompPaneResized(pane_grid::ResizeEvent),
     /// Taste „t“: Tag-Editor für den gewählten Titel öffnen
     OpenTagEditor,
     CancelTagEditor,
@@ -244,6 +247,7 @@ struct TagEditor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Music,
+    Compilations,
     MusicBrainz,
     Settings,
 }
@@ -281,6 +285,8 @@ struct PlayerApp {
     mb_result: Option<String>,
     /// MusicBrainz-Ansicht: Albumliste, Auswahl und Bilder
     mb_albums: Vec<musicbrainz::AlbumEntry>,
+    /// Indizes der durch die Suche sichtbaren Einträge von `mb_albums`
+    mb_visible: Vec<usize>,
     mb_selected: Option<usize>,
     mb_artist_image: Option<image::Handle>,
     mb_album_image: Option<image::Handle>,
@@ -299,6 +305,15 @@ struct PlayerApp {
 
     selected_artist: Option<i64>,
     selected_album: Option<i64>, // None = alle Alben des Künstlers
+
+    /// Compilations-Ansicht: Alben/Titel des Künstlers „Compilations“
+    comp_columns: pane_grid::State<Column>,
+    comp_artist: Option<i64>,
+    comp_albums: Vec<Album>,
+    comp_tracks: Vec<Track>,
+    comp_selected_album: Option<i64>,
+    /// Enthält die Mediathek überhaupt Künstler? (unabhängig von Filter/„Compilations“)
+    library_empty: bool,
 
     queue: Vec<Track>,
     queue_index: Option<usize>,
@@ -324,6 +339,7 @@ impl PlayerApp {
             mb_progress: Arc::new(musicbrainz::Progress::default()),
             mb_result: None,
             mb_albums: Vec::new(),
+            mb_visible: Vec::new(),
             mb_selected: None,
             mb_artist_image: None,
             mb_album_image: None,
@@ -342,6 +358,17 @@ impl PlayerApp {
                     b: Box::new(pane_grid::Configuration::Pane(Column::Tracks)),
                 }),
             }),
+            comp_columns: pane_grid::State::with_configuration(pane_grid::Configuration::Split {
+                axis: pane_grid::Axis::Vertical,
+                ratio: 0.3,
+                a: Box::new(pane_grid::Configuration::Pane(Column::Albums)),
+                b: Box::new(pane_grid::Configuration::Pane(Column::Tracks)),
+            }),
+            comp_artist: None,
+            comp_albums: Vec::new(),
+            comp_tracks: Vec::new(),
+            comp_selected_album: None,
+            library_empty: true,
             artists: Vec::new(),
             albums: Vec::new(),
             tracks: Vec::new(),
@@ -420,9 +447,18 @@ impl PlayerApp {
 
     fn reload_library_view(&mut self) {
         self.artists = self.library.artists().unwrap_or_default();
+        self.library_empty = self.artists.is_empty();
+        // „Compilations“ hat eine eigene Ansicht und erscheint nicht unter „Music“.
+        self.comp_artist = self
+            .artists
+            .iter()
+            .find(|a| a.name == COMPILATIONS)
+            .map(|a| a.id);
+        self.artists.retain(|a| a.name != COMPILATIONS);
         if let Some(f) = &self.filter {
             self.artists.retain(|a| f.artists.contains(&a.id));
         }
+        self.load_compilations();
         self.albums.clear();
         self.tracks.clear();
         self.selected_artist = None;
@@ -453,6 +489,29 @@ impl PlayerApp {
         self.mb_selected = None;
         self.mb_artist_image = None;
         self.mb_album_image = None;
+        self.refresh_mb_filter();
+    }
+
+    /// Wendet die Suche auf die MusicBrainz-Liste an (Künstler oder Album enthält
+    /// den Suchbegriff; passt der Künstler, sind alle seine Alben sichtbar).
+    fn refresh_mb_filter(&mut self) {
+        let query = self.filter.is_some().then(|| self.search.trim().to_lowercase());
+        self.mb_visible = self
+            .mb_albums
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                query.as_ref().is_none_or(|q| {
+                    e.artist.to_lowercase().contains(q) || e.album.to_lowercase().contains(q)
+                })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if self.mb_selected.is_some_and(|i| !self.mb_visible.contains(&i)) {
+            self.mb_selected = None;
+            self.mb_artist_image = None;
+            self.mb_album_image = None;
+        }
     }
 
     fn stop_playback(&mut self) {
@@ -524,7 +583,7 @@ impl PlayerApp {
             Message::SelectArtist(id) => self.load_artist(id),
             Message::SelectAlbum(album) => self.select_album(album),
             Message::PlayTrack(i) => {
-                self.queue = self.tracks.clone();
+                self.queue = self.visible_tracks().to_vec();
                 self.play_at(i);
             }
             Message::TogglePause => {
@@ -551,8 +610,12 @@ impl PlayerApp {
 
             Message::PaneResized(e) => self.columns.resize(e.split, e.ratio),
             Message::ShowView(view) => self.show_view(view),
+            Message::SelectCompAlbum(a) => self.select_comp_album(a),
+            Message::CompPaneResized(e) => self.comp_columns.resize(e.split, e.ratio),
             Message::OpenTagEditor => {
-                if self.view != View::Music || self.tag_editor.is_some() {
+                if !matches!(self.view, View::Music | View::Compilations)
+                    || self.tag_editor.is_some()
+                {
                     return Task::none();
                 }
                 let Some(track) = self.current_track() else {
@@ -765,6 +828,7 @@ impl PlayerApp {
                 if query.chars().count() < 2 {
                     if self.filter.take().is_some() {
                         self.reload_library_view();
+                        self.refresh_mb_filter();
                     }
                     return Task::none();
                 }
@@ -793,11 +857,13 @@ impl PlayerApp {
                 if let Some(hits) = hits {
                     self.filter = Some(hits);
                     self.reload_library_view();
+                    self.refresh_mb_filter();
                 }
             }
             Message::ScanFinished(Ok(count)) => {
                 self.search.clear();
                 self.filter = None;
+                self.refresh_mb_filter();
                 self.reload_library_view();
                 self.notice = (count == 0).then(|| {
                     "Keine Musikdateien gefunden. Erwartet wird die Struktur \
@@ -815,7 +881,10 @@ impl PlayerApp {
 
     /// Übernimmt gespeicherte Tags in DB und angezeigte Listen (ohne Neuscan).
     fn apply_saved_tags(&mut self, ed: &TagEditor) {
-        if let Err(e) = self.library.update_track_tags(ed.track_id, &ed.path, &ed.fields) {
+        if let Err(e) = self
+            .library
+            .update_track_tags(ed.track_id, &ed.path, &ed.fields)
+        {
             self.status = Some(format!("Datenbank-Update fehlgeschlagen: {e:#}"));
             return;
         }
@@ -831,6 +900,7 @@ impl PlayerApp {
         for t in self
             .tracks
             .iter_mut()
+            .chain(self.comp_tracks.iter_mut())
             .chain(self.queue.iter_mut())
             .filter(|t| t.id == ed.track_id)
         {
@@ -843,6 +913,40 @@ impl PlayerApp {
     }
 
     // --- Navigation ------------------------------------------------------
+
+    fn load_compilations(&mut self) {
+        self.comp_selected_album = None;
+        (self.comp_albums, self.comp_tracks) = match self.comp_artist {
+            Some(id) => (
+                self.library.albums(id).unwrap_or_default(),
+                self.library.tracks_by_artist(id).unwrap_or_default(),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        self.apply_filter();
+    }
+
+    fn select_comp_album(&mut self, album: Option<i64>) {
+        self.comp_selected_album = album;
+        let Some(artist) = self.comp_artist else {
+            return;
+        };
+        self.comp_tracks = match album {
+            Some(id) => self.library.tracks_by_album(id),
+            None => self.library.tracks_by_artist(artist),
+        }
+        .unwrap_or_default();
+        self.apply_filter();
+    }
+
+    /// Titel der aktuell sichtbaren Ansicht (Quelle für Abspielliste).
+    fn visible_tracks(&self) -> &[Track] {
+        if self.view == View::Compilations {
+            &self.comp_tracks
+        } else {
+            &self.tracks
+        }
+    }
 
     fn load_artist(&mut self, id: i64) {
         self.selected_artist = Some(id);
@@ -857,6 +961,8 @@ impl PlayerApp {
         if let Some(f) = &self.filter {
             self.albums.retain(|a| f.albums.contains(&a.id));
             self.tracks.retain(|t| f.tracks.contains(&t.id));
+            self.comp_albums.retain(|a| f.albums.contains(&a.id));
+            self.comp_tracks.retain(|t| f.tracks.contains(&t.id));
         }
     }
 
@@ -931,8 +1037,8 @@ impl PlayerApp {
     fn toggle_pause(&mut self) {
         if self.audio.is_active() {
             self.audio.toggle_pause();
-        } else if self.queue_index.is_none() && !self.tracks.is_empty() {
-            self.queue = self.tracks.clone();
+        } else if self.queue_index.is_none() && !self.visible_tracks().is_empty() {
+            self.queue = self.visible_tracks().to_vec();
             self.play_at(0);
         }
     }
@@ -963,7 +1069,7 @@ impl PlayerApp {
             .center(Length::Fill)
             .into(),
             Phase::NeedsFolder => self.welcome(),
-            Phase::Ready if self.artists.is_empty() && self.filter.is_none() => self.welcome(),
+            Phase::Ready if self.library_empty => self.welcome(),
             Phase::Ready => {
                 let browser = pane_grid(&self.columns, |_, kind, _| {
                     pane_grid::Content::new(match kind {
@@ -979,6 +1085,7 @@ impl PlayerApp {
 
                 let content: Element<'_, Message> = match self.view {
                     View::Music => browser.into(),
+                    View::Compilations => self.compilations_view(),
                     View::MusicBrainz => self.musicbrainz_view(),
                     View::Settings => self.settings_view(),
                 };
@@ -1031,7 +1138,12 @@ impl PlayerApp {
                 .align_y(Alignment::Center),
             )
             .width(Length::Fill)
-            .padding([8, 10])
+            .padding(Padding {
+                top: 8.0,
+                right: 18.0,
+                bottom: 8.0,
+                left: 10.0,
+            })
             .style(|_: &Theme, status| {
                 let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
                 button::Style {
@@ -1068,6 +1180,11 @@ impl PlayerApp {
             search,
             entry(ICON_MUSIC, "Music", Message::ShowView(View::Music)),
             entry(
+                ICON_COMPILATIONS,
+                "Compilations",
+                Message::ShowView(View::Compilations)
+            ),
+            entry(
                 ICON_HEXAGON,
                 "MusicBrainz",
                 Message::ShowView(View::MusicBrainz)
@@ -1075,7 +1192,7 @@ impl PlayerApp {
             entry(ICON_SETTINGS, "Settings", Message::ShowView(View::Settings))
         ]
         .spacing(4)
-        .width(Length::Fixed(150.0))
+        .width(Length::Fixed(157.0))
         .into()
     }
 
@@ -1124,7 +1241,10 @@ impl PlayerApp {
             button(text(ed.rel_path.as_str()).size(12))
                 .padding(0)
                 .style(|_: &Theme, status| button::Style {
-                    text_color: if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                    text_color: if matches!(
+                        status,
+                        button::Status::Hovered | button::Status::Pressed
+                    ) {
                         Color::WHITE
                     } else {
                         DIM
@@ -1149,7 +1269,11 @@ impl PlayerApp {
         ]
         .spacing(10);
         if let Some(err) = &ed.error {
-            col = col.push(text(err.as_str()).size(13).color(Color::from_rgb(0.95, 0.45, 0.4)));
+            col = col.push(
+                text(err.as_str())
+                    .size(13)
+                    .color(Color::from_rgb(0.95, 0.45, 0.4)),
+            );
         }
         col = col.push(
             row![
@@ -1179,7 +1303,8 @@ impl PlayerApp {
     /// MusicBrainz-Ansicht: links die Albumliste, rechts (fest, ohne Scrollbar)
     /// Künstler- und Albumbild des gewählten Albums.
     fn musicbrainz_view(&self) -> Element<'_, Message> {
-        let list = column(self.mb_albums.iter().enumerate().map(|(i, e)| {
+        let list = column(self.mb_visible.iter().map(|&i| {
+            let e = &self.mb_albums[i];
             let (state, color) = match &e.state {
                 MbState::Id(id) => (id.as_str(), TEXT),
                 MbState::NotAvailable => ("n/a", DIM),
@@ -1332,17 +1457,29 @@ impl PlayerApp {
     }
 
     fn track_pane(&self) -> Element<'_, Message> {
-        let playing_id = self.current_track().map(|t| t.id);
         // Compilation: Künstler + Album; "Alle Alben": Album; sonst nur Titel
         let compilation =
             self.selected_album.is_some() && self.tracks.iter().any(|t| t.compilation);
-        let show_artist = compilation;
-        let show_album = compilation || self.selected_album.is_none();
+        self.track_list(
+            &self.tracks,
+            compilation,
+            compilation || self.selected_album.is_none(),
+        )
+    }
+
+    /// Titelliste mit Nummer, Titel, optional Künstler/Album und Dauer.
+    fn track_list<'a>(
+        &'a self,
+        tracks: &'a [Track],
+        show_artist: bool,
+        show_album: bool,
+    ) -> Element<'a, Message> {
+        let playing_id = self.current_track().map(|t| t.id);
         fn dash(o: &Option<String>) -> &str {
             o.as_deref().unwrap_or("—")
         }
 
-        let list = column(self.tracks.iter().enumerate().map(|(i, t)| {
+        let list = column(tracks.iter().enumerate().map(|(i, t)| {
             let number = t
                 .track_no
                 .map(|n| n.to_string())
@@ -1370,6 +1507,42 @@ impl PlayerApp {
             ..Padding::ZERO
         });
         pane("TITEL", list.into())
+    }
+
+    /// Compilations: zwei Spalten (Alben des Künstlers „Compilations“ | Titel).
+    fn compilations_view(&self) -> Element<'_, Message> {
+        pane_grid(&self.comp_columns, |_, kind, _| {
+            pane_grid::Content::new(match kind {
+                Column::Tracks => self.track_list(&self.comp_tracks, true, true),
+                _ => {
+                    let all = list_button(
+                        text("Alle Alben").into(),
+                        self.comp_selected_album.is_none(),
+                        Message::SelectCompAlbum(None),
+                    );
+                    let albums = self.comp_albums.iter().map(|a| {
+                        let label = match a.year {
+                            Some(y) => format!("{y} · {}", a.title),
+                            None => a.title.clone(),
+                        };
+                        list_button(
+                            text(label).wrapping(Wrapping::None).into(),
+                            self.comp_selected_album == Some(a.id),
+                            Message::SelectCompAlbum(Some(a.id)),
+                        )
+                    });
+                    pane(
+                        "COMPILATIONS",
+                        column(std::iter::once(all).chain(albums)).into(),
+                    )
+                }
+            })
+        })
+        .spacing(8)
+        .min_size(120)
+        .on_resize(6, Message::CompPaneResized)
+        .height(Length::Fill)
+        .into()
     }
 
     fn player_bar(&self) -> Element<'_, Message> {
@@ -1464,6 +1637,9 @@ impl PlayerApp {
 // ---------------------------------------------------------------------------
 
 // Icons von https://lucide.dev (ISC-Lizenz, siehe assets/icons/LICENSE)
+/// Name des Sammel-Künstlers (Ordner „Compilations“) – eigene Ansicht
+const COMPILATIONS: &str = "Compilations";
+
 /// ID des ersten Feldes im Tag-Editor (Fokus beim Öffnen)
 const TAG_FIRST_FIELD: &str = "tag-editor-title";
 
@@ -1480,6 +1656,7 @@ const ICON_SEARCH: &[u8] = include_bytes!("../assets/icons/search.svg");
 const ICON_SPINNER: &[u8] = include_bytes!("../assets/icons/loader-circle.svg");
 const ICON_MUSIC: &[u8] = include_bytes!("../assets/icons/music.svg");
 const ICON_HEXAGON: &[u8] = include_bytes!("../assets/icons/hexagon.svg");
+const ICON_COMPILATIONS: &[u8] = include_bytes!("../assets/icons/list-music.svg");
 const ICON_SETTINGS: &[u8] = include_bytes!("../assets/icons/settings.svg");
 
 /// Einfarbiges SVG-Icon (Lucide-Icons nutzen `currentColor`, daher Farbfilter).
