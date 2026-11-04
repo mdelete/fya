@@ -213,3 +213,21 @@ mod macos {
         Some(PathBuf::from(url.path()?.to_string()))
     }
 }
+
+/// Zeigt die Datei im Dateimanager: macOS = Finder mit markierter Datei
+/// (NSWorkspace, funktioniert auch in der Sandbox), sonst der enthaltende
+/// Ordner über `xdg-open`.
+pub fn reveal_in_file_manager(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_foundation::{NSArray, NSString, NSURL};
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        let urls = NSArray::from_retained_slice(&[url]);
+        objc2_app_kit::NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(&urls);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let dir = path.parent().unwrap_or(path);
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}

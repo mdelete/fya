@@ -680,3 +680,168 @@ pub fn lower_thread_priority() {
         setpriority(0, 0, 19);
     }
 }
+
+/// Bearbeitbare Metadaten einer Datei (als Text, wie im Editor-Dialog).
+#[derive(Clone, Debug, Default)]
+pub struct TagEdit {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub album_artist: String,
+    pub composer: String,
+    pub genre: String,
+    pub track_no: String,
+    pub track_total: String,
+    pub disc_no: String,
+    pub year: String,
+    pub compilation: bool,
+}
+
+fn opt(s: &str) -> Option<String> {
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+fn parse_num(label: &str, s: &str) -> Result<Option<u32>> {
+    match s.trim() {
+        "" => Ok(None),
+        t => t
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("{label}: „{t}“ ist keine Zahl")),
+    }
+}
+
+/// Liest die Tags der Datei für den Editor.
+pub fn read_tag_edit(path: &Path) -> Result<TagEdit> {
+    let tagged = lofty::read_from_path(path)?;
+    let mut e = TagEdit::default();
+    if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
+        let s = |v: Option<std::borrow::Cow<'_, str>>| v.map(|c| c.into_owned()).unwrap_or_default();
+        let n = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_default();
+        e.title = s(tag.title());
+        e.artist = s(tag.artist());
+        e.album = s(tag.album());
+        e.genre = s(tag.genre());
+        e.album_artist = text_item(tag, &ItemKey::AlbumArtist).unwrap_or_default();
+        e.composer = text_item(tag, &ItemKey::Composer).unwrap_or_default();
+        e.track_no = n(tag.track());
+        e.track_total = n(tag.track_total());
+        e.disc_no = n(tag.disk());
+        e.year = n(tag.year());
+        e.compilation = tag
+            .get(&ItemKey::FlagCompilation)
+            .is_some_and(|item| match item.value() {
+                ItemValue::Text(t) | ItemValue::Locator(t) => {
+                    matches!(t.trim().to_lowercase().as_str(), "1" | "true" | "yes")
+                }
+                ItemValue::Binary(b) => b.first().is_some_and(|&x| x == 1 || x == b'1'),
+            });
+    }
+    Ok(e)
+}
+
+impl TagEdit {
+    /// Prüft die Zahlenfelder (vor dem Schreiben).
+    pub fn validate(&self) -> Result<()> {
+        parse_num("Track", &self.track_no)?;
+        parse_num("Track gesamt", &self.track_total)?;
+        parse_num("Disc", &self.disc_no)?;
+        parse_num("Jahr", &self.year)?;
+        Ok(())
+    }
+}
+
+/// Schreibt die bearbeiteten Metadaten in die Datei; leere Felder entfernen
+/// den jeweiligen Eintrag. Andere Tags (Cover usw.) bleiben erhalten.
+pub fn write_tag_edit(path: &Path, e: &TagEdit) -> Result<()> {
+    e.validate()?;
+    let mut tagged = lofty::read_from_path(path)?;
+    if tagged.primary_tag().is_none() && tagged.first_tag().is_none() {
+        let tag_type = tagged.primary_tag_type();
+        tagged.insert_tag(Tag::new(tag_type));
+    }
+    let tag = match tagged.primary_tag_mut() {
+        Some(t) => t,
+        None => tagged.first_tag_mut().context("kein Tag-Container")?,
+    };
+
+    match opt(&e.title) {
+        Some(v) => tag.set_title(v),
+        None => tag.remove_title(),
+    }
+    match opt(&e.artist) {
+        Some(v) => tag.set_artist(v),
+        None => tag.remove_artist(),
+    }
+    match opt(&e.album) {
+        Some(v) => tag.set_album(v),
+        None => tag.remove_album(),
+    }
+    match opt(&e.genre) {
+        Some(v) => tag.set_genre(v),
+        None => tag.remove_genre(),
+    }
+    for (key, val) in [
+        (ItemKey::AlbumArtist, &e.album_artist),
+        (ItemKey::Composer, &e.composer),
+    ] {
+        match opt(val) {
+            Some(v) => {
+                tag.insert_text(key, v);
+            }
+            None => tag.remove_key(&key),
+        }
+    }
+    match parse_num("Track", &e.track_no)? {
+        Some(v) => tag.set_track(v),
+        None => tag.remove_track(),
+    }
+    match parse_num("Track gesamt", &e.track_total)? {
+        Some(v) => tag.set_track_total(v),
+        None => tag.remove_track_total(),
+    }
+    match parse_num("Disc", &e.disc_no)? {
+        Some(v) => tag.set_disk(v),
+        None => tag.remove_disk(),
+    }
+    match parse_num("Jahr", &e.year)? {
+        Some(v) => tag.set_year(v),
+        None => tag.remove_year(),
+    }
+    if e.compilation {
+        tag.insert_text(ItemKey::FlagCompilation, "1".to_string());
+    } else {
+        tag.remove_key(&ItemKey::FlagCompilation);
+    }
+
+    tag.save_to_path(path, WriteOptions::default())?;
+    Ok(())
+}
+
+impl Library {
+    /// Übernimmt bearbeitete Tags in die Mediathek (ohne Neuscan).
+    pub fn update_track_tags(&self, id: i64, path: &Path, e: &TagEdit) -> Result<()> {
+        let title = opt(&e.title).unwrap_or_else(|| file_stem(path));
+        self.conn.execute(
+            "UPDATE tracks SET title = ?1, artist_tag = ?2, album_tag = ?3,
+                    album_artist_tag = ?4, composer = ?5, track_no = ?6, track_total = ?7,
+                    compilation = ?8, disc_no = ?9, year = ?10
+             WHERE id = ?11",
+            params![
+                title,
+                opt(&e.artist),
+                opt(&e.album),
+                opt(&e.album_artist),
+                opt(&e.composer),
+                parse_num("Track", &e.track_no)?,
+                parse_num("Track gesamt", &e.track_total)?,
+                e.compilation,
+                parse_num("Disc", &e.disc_no)?.unwrap_or(1),
+                parse_num("Jahr", &e.year)?,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+}

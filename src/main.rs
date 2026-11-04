@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, column, container, image, pane_grid, row, scrollable, slider, stack, svg, text,
-    text_input,
+    button, checkbox, column, container, image, mouse_area, opaque, pane_grid, row, scrollable,
+    slider, stack, svg, text, text_input,
 };
 use iced::{
     Alignment, Border, Color, Element, Event, Font, Length, Padding, Subscription, Task, Theme,
@@ -20,7 +20,7 @@ use iced::{
 };
 
 use audio::Audio;
-use db::{Album, Artist, Library, MusicRoot, SearchHits, Track};
+use db::{Album, Artist, Library, MusicRoot, SearchHits, TagEdit, Track};
 use folder::FolderAccess;
 use musicbrainz::MbState;
 
@@ -182,6 +182,19 @@ enum Message {
     PaneResized(pane_grid::ResizeEvent),
     ShowView(View),
     SelectMbAlbum(usize),
+    /// Taste „t“: Tag-Editor für den gewählten Titel öffnen
+    OpenTagEditor,
+    CancelTagEditor,
+    /// Datei im Finder/Dateimanager zeigen
+    RevealFile(PathBuf),
+    /// Eingabe in einem Feld des Tag-Editors
+    EditTag(TagField, String),
+    EditCompilation(bool),
+    SaveTags,
+    /// Ergebnis des Schreibens in die Datei
+    TagsSaved(Result<(), String>),
+    /// Tab-Taste im Tag-Editor (true = mit Shift)
+    TabPressed(bool),
     /// Bilder geladen (Künstler, Album, Ergebnis)
     MbImages(String, String, Option<musicbrainz::Images>),
     /// Ordner-Dialog öffnen
@@ -197,6 +210,31 @@ enum Message {
     SearchChanged(String),
     /// Ergebnis der Hintergrundsuche (Suchbegriff, Treffer)
     SearchDone(String, Option<SearchHits>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagField {
+    Title,
+    Artist,
+    Album,
+    AlbumArtist,
+    Composer,
+    Genre,
+    TrackNo,
+    TrackTotal,
+    DiscNo,
+    Year,
+}
+
+/// Zustand des modalen Tag-Editors
+struct TagEditor {
+    track_id: i64,
+    path: PathBuf,
+    /// Pfad relativ zur Musikbibliothek (zur Anzeige)
+    rel_path: String,
+    fields: TagEdit,
+    error: Option<String>,
+    saving: bool,
 }
 
 /// Inhalt der rechten Seite (neben der Buttonleiste)
@@ -232,6 +270,8 @@ struct PlayerApp {
     notice: Option<String>,
     view: View,
     /// Läuft gerade der MusicBrainz-Abgleich? (+ Abbruch-Flag des Threads)
+    /// Offener Tag-Editor (modal)
+    tag_editor: Option<TagEditor>,
     mb_running: bool,
     mb_cancel: Arc<AtomicBool>,
     mb_progress: Arc<musicbrainz::Progress>,
@@ -275,6 +315,7 @@ impl PlayerApp {
             phase: Phase::NeedsFolder,
             notice: None,
             view: View::Music,
+            tag_editor: None,
             mb_running: false,
             mb_cancel: Arc::new(AtomicBool::new(false)),
             mb_progress: Arc::new(musicbrainz::Progress::default()),
@@ -437,6 +478,32 @@ impl PlayerApp {
                 }),
                 event::Status::Ignored,
             ) => Some(Message::TogglePause),
+            // „t“ (ohne Modifier, nur wenn kein Textfeld die Taste verbraucht hat)
+            (
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(c),
+                    modifiers,
+                    ..
+                }),
+                event::Status::Ignored,
+            ) if c.as_str().eq_ignore_ascii_case("t") && modifiers.is_empty() => {
+                Some(Message::OpenTagEditor)
+            }
+            (
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                }),
+                _,
+            ) => Some(Message::CancelTagEditor),
+            (
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                    modifiers,
+                    ..
+                }),
+                _,
+            ) => Some(Message::TabPressed(modifiers.shift())),
             _ => None,
         });
 
@@ -457,7 +524,11 @@ impl PlayerApp {
                 self.queue = self.tracks.clone();
                 self.play_at(i);
             }
-            Message::TogglePause => self.toggle_pause(),
+            Message::TogglePause => {
+                if self.tag_editor.is_none() {
+                    self.toggle_pause();
+                }
+            }
             Message::Next => self.next(),
             Message::Previous => self.previous(),
             Message::Tick => {
@@ -477,6 +548,110 @@ impl PlayerApp {
 
             Message::PaneResized(e) => self.columns.resize(e.split, e.ratio),
             Message::ShowView(view) => self.show_view(view),
+            Message::OpenTagEditor => {
+                if self.view != View::Music || self.tag_editor.is_some() {
+                    return Task::none();
+                }
+                let Some(track) = self.current_track() else {
+                    return Task::none();
+                };
+                let (track_id, path) = (track.id, track.path.clone());
+                let rel_path = self
+                    .access
+                    .as_ref()
+                    .and_then(|a| path.strip_prefix(a.path()).ok())
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                match db::read_tag_edit(&path) {
+                    Ok(fields) => {
+                        self.tag_editor = Some(TagEditor {
+                            track_id,
+                            path,
+                            rel_path,
+                            fields,
+                            error: None,
+                            saving: false,
+                        });
+                        return iced::widget::operation::focus(TAG_FIRST_FIELD);
+                    }
+                    Err(e) => self.status = Some(format!("Tags nicht lesbar: {e:#}")),
+                }
+            }
+            Message::CancelTagEditor => {
+                if self.tag_editor.as_ref().is_some_and(|ed| !ed.saving) {
+                    self.tag_editor = None;
+                }
+            }
+            Message::RevealFile(path) => folder::reveal_in_file_manager(&path),
+            Message::TabPressed(shift) => {
+                if self.tag_editor.is_some() {
+                    return if shift {
+                        iced::widget::operation::focus_previous()
+                    } else {
+                        iced::widget::operation::focus_next()
+                    };
+                }
+            }
+            Message::EditTag(field, value) => {
+                if let Some(ed) = &mut self.tag_editor {
+                    let f = &mut ed.fields;
+                    *match field {
+                        TagField::Title => &mut f.title,
+                        TagField::Artist => &mut f.artist,
+                        TagField::Album => &mut f.album,
+                        TagField::AlbumArtist => &mut f.album_artist,
+                        TagField::Composer => &mut f.composer,
+                        TagField::Genre => &mut f.genre,
+                        TagField::TrackNo => &mut f.track_no,
+                        TagField::TrackTotal => &mut f.track_total,
+                        TagField::DiscNo => &mut f.disc_no,
+                        TagField::Year => &mut f.year,
+                    } = value;
+                    ed.error = None;
+                }
+            }
+            Message::EditCompilation(v) => {
+                if let Some(ed) = &mut self.tag_editor {
+                    ed.fields.compilation = v;
+                }
+            }
+            Message::SaveTags => {
+                let Some(ed) = &mut self.tag_editor else {
+                    return Task::none();
+                };
+                if ed.saving {
+                    return Task::none();
+                }
+                if let Err(e) = ed.fields.validate() {
+                    ed.error = Some(e.to_string());
+                    return Task::none();
+                }
+                ed.saving = true;
+                let (path, fields) = (ed.path.clone(), ed.fields.clone());
+                // Datei schreiben im Hintergrund (kann bei großen Dateien dauern)
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            db::write_tag_edit(&path, &fields).map_err(|e| format!("{e:#}"))
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
+                    },
+                    Message::TagsSaved,
+                );
+            }
+            Message::TagsSaved(Err(e)) => {
+                if let Some(ed) = &mut self.tag_editor {
+                    ed.saving = false;
+                    ed.error = Some(format!("Schreiben fehlgeschlagen: {e}"));
+                }
+            }
+            Message::TagsSaved(Ok(())) => {
+                if let Some(ed) = self.tag_editor.take() {
+                    self.apply_saved_tags(&ed);
+                }
+            }
             Message::SelectMbAlbum(i) => {
                 self.mb_selected = Some(i);
                 self.mb_artist_image = None;
@@ -635,6 +810,35 @@ impl PlayerApp {
         Task::none()
     }
 
+    /// Übernimmt gespeicherte Tags in DB und angezeigte Listen (ohne Neuscan).
+    fn apply_saved_tags(&mut self, ed: &TagEditor) {
+        if let Err(e) = self.library.update_track_tags(ed.track_id, &ed.path, &ed.fields) {
+            self.status = Some(format!("Datenbank-Update fehlgeschlagen: {e:#}"));
+            return;
+        }
+        let f = &ed.fields;
+        let non_empty = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
+        let title = non_empty(&f.title).unwrap_or_else(|| {
+            ed.path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+        let track_no = f.track_no.trim().parse().ok();
+        for t in self
+            .tracks
+            .iter_mut()
+            .chain(self.queue.iter_mut())
+            .filter(|t| t.id == ed.track_id)
+        {
+            t.title = title.clone();
+            t.artist_tag = non_empty(&f.artist);
+            t.album_tag = non_empty(&f.album);
+            t.track_no = track_no;
+            t.compilation = f.compilation;
+        }
+    }
+
     // --- Navigation ------------------------------------------------------
 
     fn load_artist(&mut self, id: i64) {
@@ -786,7 +990,11 @@ impl PlayerApp {
                     bottom: 8.0,
                     left: 8.0,
                 });
-                main.into()
+                if self.tag_editor.is_some() {
+                    stack![main, self.tag_editor_dialog()].into()
+                } else {
+                    main.into()
+                }
             }
         }
     }
@@ -866,6 +1074,103 @@ impl PlayerApp {
         .spacing(4)
         .width(Length::Fixed(150.0))
         .into()
+    }
+
+    /// Modaler Tag-Editor (Taste „t“); Klick daneben oder Esc schließt.
+    fn tag_editor_dialog(&self) -> Element<'_, Message> {
+        let Some(ed) = &self.tag_editor else {
+            return container(text("")).into();
+        };
+        let f = &ed.fields;
+        let saving = ed.saving;
+
+        let field = |label: &'static str, value: &str, kind: TagField| {
+            let mut input = text_input("", value).padding(6).size(14);
+            if !saving {
+                input = input
+                    .on_input(move |v| Message::EditTag(kind, v))
+                    .on_submit(Message::SaveTags);
+            }
+            if kind == TagField::Title {
+                input = input.id(TAG_FIRST_FIELD);
+            }
+            row![container(text(label).size(13).color(DIM)).width(110), input]
+                .spacing(8)
+                .align_y(Alignment::Center)
+        };
+        let small = |label: &'static str, value: &str, kind: TagField| {
+            let mut input = text_input("", value).padding(6).size(14).width(70);
+            if !saving {
+                input = input
+                    .on_input(move |v| Message::EditTag(kind, v))
+                    .on_submit(Message::SaveTags);
+            }
+            row![text(label).size(13).color(DIM), input]
+                .spacing(8)
+                .align_y(Alignment::Center)
+        };
+
+        let mut compilation = checkbox(f.compilation).label("Compilation");
+        if !saving {
+            compilation = compilation.on_toggle(Message::EditCompilation);
+        }
+
+        let mut col = column![
+            text("Metadaten bearbeiten").size(20),
+            // Relativer Pfad; Klick zeigt die Datei im Finder
+            button(text(ed.rel_path.as_str()).size(12))
+                .padding(0)
+                .style(|_: &Theme, status| button::Style {
+                    text_color: if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                        Color::WHITE
+                    } else {
+                        DIM
+                    },
+                    ..button::Style::default()
+                })
+                .on_press(Message::RevealFile(ed.path.clone())),
+            field("Titel", &f.title, TagField::Title),
+            field("Künstler", &f.artist, TagField::Artist),
+            field("Album", &f.album, TagField::Album),
+            field("Albumkünstler", &f.album_artist, TagField::AlbumArtist),
+            field("Komponist", &f.composer, TagField::Composer),
+            field("Genre", &f.genre, TagField::Genre),
+            row![
+                small("Track", &f.track_no, TagField::TrackNo),
+                small("von", &f.track_total, TagField::TrackTotal),
+                small("Disc", &f.disc_no, TagField::DiscNo),
+                small("Jahr", &f.year, TagField::Year),
+            ]
+            .spacing(16),
+            compilation,
+        ]
+        .spacing(10);
+        if let Some(err) = &ed.error {
+            col = col.push(text(err.as_str()).size(13).color(Color::from_rgb(0.95, 0.45, 0.4)));
+        }
+        col = col.push(
+            row![
+                button("Abbrechen").on_press_maybe((!saving).then_some(Message::CancelTagEditor)),
+                button(if saving { "Speichern …" } else { "Speichern" })
+                    .on_press_maybe((!saving).then_some(Message::SaveTags)),
+            ]
+            .spacing(8),
+        );
+
+        let dialog = container(col).padding(20).max_width(560).style(panel_style);
+
+        // Abgedunkelter Hintergrund; Klick daneben schließt, Klicks auf den Dialog nicht.
+        opaque(
+            mouse_area(
+                container(opaque(dialog))
+                    .center(Length::Fill)
+                    .style(|_: &Theme| container::Style {
+                        background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.6).into()),
+                        ..container::Style::default()
+                    }),
+            )
+            .on_press(Message::CancelTagEditor),
+        )
     }
 
     /// MusicBrainz-Ansicht: links die Albumliste, rechts (fest, ohne Scrollbar)
@@ -1156,6 +1461,9 @@ impl PlayerApp {
 // ---------------------------------------------------------------------------
 
 // Icons von https://lucide.dev (ISC-Lizenz, siehe assets/icons/LICENSE)
+/// ID des ersten Feldes im Tag-Editor (Fokus beim Öffnen)
+const TAG_FIRST_FIELD: &str = "tag-editor-title";
+
 /// Schriftgröße der MBID-Spalte (UUID = 36 Zeichen)
 const MBID_SIZE: f32 = 10.0;
 

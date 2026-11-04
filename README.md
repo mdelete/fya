@@ -1,11 +1,10 @@
 # FYA
 
 Minimaler Musik-Player: Rust + iced, SQLite-Bibliothek, rodio-Wiedergabe.
-Formate: mp3, aac, m4a (AAC), opus (reines Rust über `opus-rs`).
+Formate: mp3, aac, m4a (AAC), opus (über `opus-rs`).
 
 ## Musikordner
-Der Ordner wird nicht mehr im Code festgelegt, sondern beim ersten Start im
-Ordner-Dialog gewählt. Erwartete Struktur:
+Wird beim ersten Start im Ordner-Dialog gewählt. Erwartete Struktur:
 `<Ordner>/<Artist>/<Album>/<Song.mp3|aac|m4a|opus>`
 
 Das Ergebnis des Dialogs steht in der Datenbank (Tabelle `settings`, Schlüssel
@@ -68,3 +67,7 @@ install -Dm644 linux/fya.desktop ~/.local/share/applications/fya.desktop
 ## Bedienung
 Ordner wählen → Künstler → Album → Titel anklicken. Leertaste = Play/Pause,
 Slider unten = Spulen und Lautstärke.
+
+## Links
+
+ * [BPM Analyzer](https://github.com/not-jan/bpm-analyzer)
