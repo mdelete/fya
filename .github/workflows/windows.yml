@@ -1,0 +1,18 @@
+name: Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - run: cargo test --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fya-windows-x64
+          path: target/release/fya.exe

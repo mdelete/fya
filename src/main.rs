@@ -1,3 +1,6 @@
+// Windows-Release: keine Konsole hinter dem Fenster
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod audio;
 mod db;
 mod folder;

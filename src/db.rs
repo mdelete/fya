@@ -679,6 +679,17 @@ pub fn lower_thread_priority() {
     unsafe {
         setpriority(0, 0, 19);
     }
+    // Windows: THREAD_PRIORITY_LOWEST (-2) nur für den aufrufenden Thread.
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn GetCurrentThread() -> *mut core::ffi::c_void;
+            fn SetThreadPriority(thread: *mut core::ffi::c_void, priority: i32) -> i32;
+        }
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), -2);
+        }
+    }
 }
 
 /// Bearbeitbare Metadaten einer Datei (als Text, wie im Editor-Dialog).

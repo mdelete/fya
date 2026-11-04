@@ -88,7 +88,7 @@ impl FolderAccess {
     }
 }
 
-/// Nativer Ordner-Dialog (macOS: NSOpenPanel, Linux: XDG Desktop Portal).
+/// Nativer Ordner-Dialog (macOS: NSOpenPanel, Linux: XDG Desktop Portal, Windows: IFileDialog).
 #[cfg(not(target_os = "macos"))]
 pub async fn pick_folder(start: Option<PathBuf>) -> Option<PathBuf> {
     let mut dialog = rfd::AsyncFileDialog::new().set_title("Musikordner wählen");
@@ -216,7 +216,7 @@ mod macos {
 
 /// Zeigt die Datei im Dateimanager: macOS = Finder mit markierter Datei
 /// (NSWorkspace, funktioniert auch in der Sandbox), sonst der enthaltende
-/// Ordner über `xdg-open`.
+/// Ordner über `xdg-open`; Windows = Explorer mit markierter Datei.
 pub fn reveal_in_file_manager(path: &Path) {
     #[cfg(target_os = "macos")]
     {
@@ -225,7 +225,14 @@ pub fn reveal_in_file_manager(path: &Path) {
         let urls = NSArray::from_retained_slice(&[url]);
         objc2_app_kit::NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(&urls);
     }
-    #[cfg(not(target_os = "macos"))]
+    // Windows: Explorer mit markierter Datei
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn();
+    }
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
     {
         let dir = path.parent().unwrap_or(path);
         let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
