@@ -200,6 +200,9 @@ enum Message {
     AddToNewPlaylist,
     RemoveFromPlaylist(PathBuf),
     AskDeletePlaylist(i64),
+    AskRenamePlaylist(i64),
+    /// Alt+↑ / Alt+↓: laufenden Titel in der Playlist verschieben (-1 / +1)
+    MovePlaylistTrack(i32),
     /// Esc: schließt den jeweils offenen Dialog
     Escape,
     PlaylistPaneResized(pane_grid::ResizeEvent),
@@ -271,6 +274,12 @@ enum PlaylistDialog {
     AddTrack {
         path: PathBuf,
         title: String,
+        error: Option<String>,
+    },
+    /// Playlist umbenennen
+    Rename {
+        id: i64,
+        name: String,
         error: Option<String>,
     },
     /// Löschen bestätigen
@@ -625,6 +634,16 @@ impl PlayerApp {
             ) => Some(Message::Escape),
             (
                 Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(named @ (keyboard::key::Named::ArrowUp | keyboard::key::Named::ArrowDown)),
+                    modifiers,
+                    ..
+                }),
+                _,
+            ) if modifiers.alt() && !modifiers.command() => Some(Message::MovePlaylistTrack(
+                if named == keyboard::key::Named::ArrowUp { -1 } else { 1 },
+            )),
+            (
+                Event::Keyboard(keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Tab),
                     modifiers,
                     ..
@@ -735,12 +754,52 @@ impl PlayerApp {
                 }
             }
             Message::PlaylistName(v) => {
-                if let Some(PlaylistDialog::New { name, error, .. }) = &mut self.playlist_dialog {
-                    *name = v;
-                    *error = None;
+                match &mut self.playlist_dialog {
+                    Some(PlaylistDialog::New { name, error, .. })
+                    | Some(PlaylistDialog::Rename { name, error, .. }) => {
+                        *name = v;
+                        *error = None;
+                    }
+                    _ => {}
                 }
             }
             Message::ClosePlaylistDialog => self.playlist_dialog = None,
+            Message::AskRenamePlaylist(id) => {
+                if let Some(p) = self.playlists.iter().find(|p| p.id == id) {
+                    self.playlist_dialog = Some(PlaylistDialog::Rename {
+                        id,
+                        name: p.name.clone(),
+                        error: None,
+                    });
+                    return iced::widget::operation::focus(PLAYLIST_NAME_FIELD);
+                }
+            }
+            Message::MovePlaylistTrack(delta) => {
+                if self.view != View::Playlists
+                    || self.tag_editor.is_some()
+                    || self.playlist_dialog.is_some()
+                {
+                    return Task::none();
+                }
+                let (Some(id), Some(track)) = (self.pl_selected, self.current_track()) else {
+                    return Task::none();
+                };
+                let (track_id, path) = (track.id, track.path.clone());
+                match self.library.move_in_playlist(id, &path, delta) {
+                    Ok(true) => {
+                        self.select_playlist(Some(id));
+                        // Abspielliste an die neue Reihenfolge angleichen
+                        let queue: Vec<Track> =
+                            self.pl_tracks.iter().filter(|t| !t.missing).cloned().collect();
+                        if let Some(i) = queue.iter().position(|t| t.id == track_id) {
+                            self.queue = queue;
+                            self.queue_index = Some(i);
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => self.status = Some(format!("Verschieben fehlgeschlagen: {e:#}")),
+                }
+            }
             Message::AskDeletePlaylist(id) => {
                 if let Some(p) = self.playlists.iter().find(|p| p.id == id) {
                     self.playlist_dialog = Some(PlaylistDialog::Delete {
@@ -774,6 +833,15 @@ impl PlayerApp {
                             }
                             self.playlist_dialog = None;
                             self.pl_selected = Some(id);
+                            self.load_playlists();
+                        }
+                        Err(e) => *error = Some(e.to_string()),
+                    }
+                }
+                Some(PlaylistDialog::Rename { id, name, error }) => {
+                    match self.library.rename_playlist(*id, name) {
+                        Ok(()) => {
+                            self.playlist_dialog = None;
                             self.load_playlists();
                         }
                         Err(e) => *error = Some(e.to_string()),
@@ -1768,6 +1836,22 @@ impl PlayerApp {
             ]
             .spacing(10)
             .into(),
+            PlaylistDialog::Rename { name, error, .. } => column![
+                text("Playlist umbenennen").size(20),
+                text_input("Name", name)
+                    .id(PLAYLIST_NAME_FIELD)
+                    .on_input(Message::PlaylistName)
+                    .on_submit(Message::ConfirmPlaylistDialog)
+                    .padding(6),
+                err(error),
+                row![
+                    button("Abbrechen").on_press(Message::ClosePlaylistDialog),
+                    button("Umbenennen").on_press(Message::ConfirmPlaylistDialog),
+                ]
+                .spacing(8),
+            ]
+            .spacing(10)
+            .into(),
             PlaylistDialog::AddTrack { title, error, .. } => {
                 let list: Element<'_, Message> = if self.playlists.is_empty() {
                     column![].into()
@@ -1830,6 +1914,7 @@ impl PlayerApp {
                                     text(p.name.as_str())
                                         .wrapping(Wrapping::None)
                                         .width(Length::Fill),
+                                    small_glyph_button("✎", Message::AskRenamePlaylist(p.id)),
                                     small_x_button(Message::AskDeletePlaylist(p.id)),
                                 ]
                                 .align_y(Alignment::Center)
@@ -2107,9 +2192,9 @@ fn modal<'a>(dialog: Element<'a, Message>, on_close: Message) -> Element<'a, Mes
     )
 }
 
-/// Kleines „✕“ ohne Rahmen; beim Darüberfahren heller.
-fn small_x_button(on_press: Message) -> Element<'static, Message> {
-    button(text("✕").size(12))
+/// Kleines Zeichen als Knopf ohne Rahmen; beim Darüberfahren heller.
+fn small_glyph_button(glyph: &'static str, on_press: Message) -> Element<'static, Message> {
+    button(text(glyph).size(12))
         .padding([0, 4])
         .style(|_: &Theme, status| button::Style {
             text_color: if matches!(status, button::Status::Hovered | button::Status::Pressed) {
@@ -2121,6 +2206,11 @@ fn small_x_button(on_press: Message) -> Element<'static, Message> {
         })
         .on_press(on_press)
         .into()
+}
+
+/// Kleines „✕“ (Entfernen/Löschen).
+fn small_x_button(on_press: Message) -> Element<'static, Message> {
+    small_glyph_button("✕", on_press)
 }
 
 /// Einzeiliger, abgeschnittener Text.

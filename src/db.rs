@@ -433,6 +433,54 @@ impl Library {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Benennt eine Playlist um (Name eindeutig, ohne Groß-/Kleinschreibung).
+    pub fn rename_playlist(&self, id: i64, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("Bitte einen Namen eingeben");
+        }
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM playlists WHERE name = ?1 COLLATE NOCASE AND id <> ?2)",
+            params![name, id],
+            |r| r.get(0),
+        )?;
+        if exists {
+            bail!("Eine Playlist „{name}“ gibt es schon");
+        }
+        self.conn
+            .execute("UPDATE playlists SET name = ?1 WHERE id = ?2", params![name, id])?;
+        Ok(())
+    }
+
+    /// Verschiebt einen Titel um `delta` (-1 = nach oben, +1 = nach unten).
+    /// Rückgabe: false, wenn er schon am Rand steht oder nicht enthalten ist.
+    pub fn move_in_playlist(&self, id: i64, path: &Path, delta: i32) -> Result<bool> {
+        let rows: Vec<(i64, String)> = {
+            let mut st = self.conn.prepare(
+                "SELECT position, path FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position",
+            )?;
+            st.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let path = path.to_string_lossy();
+        let Some(i) = rows.iter().position(|(_, p)| *p == path) else {
+            return Ok(false);
+        };
+        let j = i as i64 + delta as i64;
+        if j < 0 || j >= rows.len() as i64 {
+            return Ok(false);
+        }
+        let (pos_a, pos_b) = (rows[i].0, rows[j as usize].0);
+        // Positionen tauschen (Primärschlüssel -> über eine freie Zwischenposition)
+        let tx = self.conn.unchecked_transaction()?;
+        let upd = "UPDATE playlist_tracks SET position = ?1 WHERE playlist_id = ?2 AND position = ?3";
+        tx.execute(upd, params![-1, id, pos_a])?;
+        tx.execute(upd, params![pos_a, id, pos_b])?;
+        tx.execute(upd, params![pos_b, id, -1])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn delete_playlist(&self, id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM playlist_tracks WHERE playlist_id = ?1", [id])?;
@@ -1018,6 +1066,21 @@ mod playlist_tests {
 
         lib.remove_from_playlist(id, p).unwrap();
         assert!(lib.playlist_tracks(id).unwrap().is_empty());
+
+        // Umsortieren + Umbenennen
+        let (a, b) = (Path::new("/x/a.mp3"), Path::new("/x/b.mp3"));
+        lib.add_to_playlist(id, a).unwrap();
+        lib.add_to_playlist(id, b).unwrap();
+        assert!(!lib.move_in_playlist(id, a, -1).unwrap(), "am Anfang");
+        assert!(lib.move_in_playlist(id, a, 1).unwrap());
+        let titles: Vec<_> = lib.playlist_tracks(id).unwrap().into_iter().map(|t| t.title).collect();
+        assert_eq!(titles, ["b", "a"]);
+        let other = lib.create_playlist("Andere").unwrap();
+        assert!(lib.rename_playlist(id, "andere").is_err(), "Name vergeben");
+        lib.rename_playlist(id, "Mix").unwrap(); // eigener Name ist erlaubt
+        lib.rename_playlist(id, "Neu").unwrap();
+        assert!(lib.playlists().unwrap().iter().any(|p| p.name == "Neu"));
+        lib.delete_playlist(other).unwrap();
         lib.delete_playlist(id).unwrap();
         assert!(lib.playlists().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
