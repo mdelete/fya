@@ -23,7 +23,7 @@ use iced::{
 };
 
 use audio::Audio;
-use db::{Album, Artist, Library, MusicRoot, SearchHits, TagEdit, Track};
+use db::{Album, Artist, Library, MusicRoot, Playlist, SearchHits, TagEdit, Track};
 use folder::FolderAccess;
 use musicbrainz::MbState;
 
@@ -102,6 +102,8 @@ const SELECTED: Color = Color::from_rgb(0.098, 0.094, 0.114); // gewählte Zeile
 const HOVER: Color = Color::from_rgb(0.175, 0.170, 0.196);
 const BORDER: Color = Color::from_rgb(0.55, 0.52, 0.53);
 const TEXT: Color = Color::from_rgb(0.94, 0.88, 0.67); // creme
+/// Warnfarbe (Fehler, ⚠)
+const WARN: Color = Color::from_rgb(0.95, 0.62, 0.3);
 const DIM: Color = Color::from_rgb(0.54, 0.49, 0.46); // Überschriften, Zeiten
 
 fn theme() -> Theme {
@@ -187,6 +189,20 @@ enum Message {
     SelectMbAlbum(usize),
     /// Album in der Compilations-Ansicht (None = alle)
     SelectCompAlbum(Option<i64>),
+    SelectPlaylist(i64),
+    /// Taste „p“: Titel zu Playlist hinzufügen
+    OpenAddToPlaylist,
+    NewPlaylist,
+    PlaylistName(String),
+    ConfirmPlaylistDialog,
+    ClosePlaylistDialog,
+    AddToPlaylist(i64),
+    AddToNewPlaylist,
+    RemoveFromPlaylist(PathBuf),
+    AskDeletePlaylist(i64),
+    /// Esc: schließt den jeweils offenen Dialog
+    Escape,
+    PlaylistPaneResized(pane_grid::ResizeEvent),
     CompPaneResized(pane_grid::ResizeEvent),
     /// Taste „t“: Tag-Editor für den gewählten Titel öffnen
     OpenTagEditor,
@@ -243,17 +259,37 @@ struct TagEditor {
     saving: bool,
 }
 
+/// Modale Dialoge rund um Playlists
+enum PlaylistDialog {
+    /// Neue Playlist anlegen; `add` = Titel, der danach hinein soll
+    New {
+        name: String,
+        add: Option<PathBuf>,
+        error: Option<String>,
+    },
+    /// Titel (Taste „p“) einer Playlist hinzufügen
+    AddTrack {
+        path: PathBuf,
+        title: String,
+        error: Option<String>,
+    },
+    /// Löschen bestätigen
+    Delete { id: i64, name: String },
+}
+
 /// Inhalt der rechten Seite (neben der Buttonleiste)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Music,
     Compilations,
+    Playlists,
     MusicBrainz,
     Settings,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Column {
+    Playlists,
     Artists,
     Albums,
     Tracks,
@@ -315,6 +351,13 @@ struct PlayerApp {
     /// Enthält die Mediathek überhaupt Künstler? (unabhängig von Filter/„Compilations“)
     library_empty: bool,
 
+    /// Playlists-Ansicht
+    pl_columns: pane_grid::State<Column>,
+    playlists: Vec<Playlist>,
+    pl_selected: Option<i64>,
+    pl_tracks: Vec<Track>,
+    playlist_dialog: Option<PlaylistDialog>,
+
     queue: Vec<Track>,
     queue_index: Option<usize>,
     /// Cover des laufenden Titels (falls in der Datei eingebettet)
@@ -369,6 +412,16 @@ impl PlayerApp {
             comp_tracks: Vec::new(),
             comp_selected_album: None,
             library_empty: true,
+            pl_columns: pane_grid::State::with_configuration(pane_grid::Configuration::Split {
+                axis: pane_grid::Axis::Vertical,
+                ratio: 0.3,
+                a: Box::new(pane_grid::Configuration::Pane(Column::Playlists)),
+                b: Box::new(pane_grid::Configuration::Pane(Column::Tracks)),
+            }),
+            playlists: Vec::new(),
+            pl_selected: None,
+            pl_tracks: Vec::new(),
+            playlist_dialog: None,
             artists: Vec::new(),
             albums: Vec::new(),
             tracks: Vec::new(),
@@ -459,6 +512,7 @@ impl PlayerApp {
             self.artists.retain(|a| f.artists.contains(&a.id));
         }
         self.load_compilations();
+        self.load_playlists();
         self.albums.clear();
         self.tracks.clear();
         self.selected_artist = None;
@@ -551,13 +605,24 @@ impl PlayerApp {
             ) if c.as_str().eq_ignore_ascii_case("t") && modifiers.is_empty() => {
                 Some(Message::OpenTagEditor)
             }
+            // „p“: Titel zu Playlist hinzufügen
+            (
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(c),
+                    modifiers,
+                    ..
+                }),
+                event::Status::Ignored,
+            ) if c.as_str().eq_ignore_ascii_case("p") && modifiers.is_empty() => {
+                Some(Message::OpenAddToPlaylist)
+            }
             (
                 Event::Keyboard(keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Escape),
                     ..
                 }),
                 _,
-            ) => Some(Message::CancelTagEditor),
+            ) => Some(Message::Escape),
             (
                 Event::Keyboard(keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Tab),
@@ -583,11 +648,26 @@ impl PlayerApp {
             Message::SelectArtist(id) => self.load_artist(id),
             Message::SelectAlbum(album) => self.select_album(album),
             Message::PlayTrack(i) => {
-                self.queue = self.visible_tracks().to_vec();
-                self.play_at(i);
+                let list = self.visible_tracks();
+                let Some(clicked) = list.get(i) else {
+                    return Task::none();
+                };
+                if clicked.missing {
+                    self.status = Some(format!(
+                        "Datei nicht in der Mediathek: {}",
+                        clicked.path.display()
+                    ));
+                    return Task::none();
+                }
+                // Fehlende Playlist-Einträge überspringen
+                let clicked_id = clicked.id;
+                let queue: Vec<Track> = list.iter().filter(|t| !t.missing).cloned().collect();
+                let index = queue.iter().position(|t| t.id == clicked_id).unwrap_or(0);
+                self.queue = queue;
+                self.play_at(index);
             }
             Message::TogglePause => {
-                if self.tag_editor.is_none() {
+                if self.tag_editor.is_none() && self.playlist_dialog.is_none() {
                     self.toggle_pause();
                 }
             }
@@ -611,10 +691,124 @@ impl PlayerApp {
             Message::PaneResized(e) => self.columns.resize(e.split, e.ratio),
             Message::ShowView(view) => self.show_view(view),
             Message::SelectCompAlbum(a) => self.select_comp_album(a),
+            Message::SelectPlaylist(id) => self.select_playlist(Some(id)),
+            Message::Escape => {
+                if self.tag_editor.as_ref().is_some_and(|ed| !ed.saving) {
+                    self.tag_editor = None;
+                } else {
+                    self.playlist_dialog = None;
+                }
+            }
+            Message::OpenAddToPlaylist => {
+                if !matches!(
+                    self.view,
+                    View::Music | View::Compilations | View::Playlists
+                ) || self.tag_editor.is_some()
+                    || self.playlist_dialog.is_some()
+                {
+                    return Task::none();
+                }
+                if let Some(t) = self.current_track() {
+                    self.playlist_dialog = Some(PlaylistDialog::AddTrack {
+                        path: t.path.clone(),
+                        title: t.title.clone(),
+                        error: None,
+                    });
+                }
+            }
+            Message::NewPlaylist => {
+                self.playlist_dialog = Some(PlaylistDialog::New {
+                    name: String::new(),
+                    add: None,
+                    error: None,
+                });
+                return iced::widget::operation::focus(PLAYLIST_NAME_FIELD);
+            }
+            Message::AddToNewPlaylist => {
+                if let Some(PlaylistDialog::AddTrack { path, .. }) = &self.playlist_dialog {
+                    self.playlist_dialog = Some(PlaylistDialog::New {
+                        name: String::new(),
+                        add: Some(path.clone()),
+                        error: None,
+                    });
+                    return iced::widget::operation::focus(PLAYLIST_NAME_FIELD);
+                }
+            }
+            Message::PlaylistName(v) => {
+                if let Some(PlaylistDialog::New { name, error, .. }) = &mut self.playlist_dialog {
+                    *name = v;
+                    *error = None;
+                }
+            }
+            Message::ClosePlaylistDialog => self.playlist_dialog = None,
+            Message::AskDeletePlaylist(id) => {
+                if let Some(p) = self.playlists.iter().find(|p| p.id == id) {
+                    self.playlist_dialog = Some(PlaylistDialog::Delete {
+                        id,
+                        name: p.name.clone(),
+                    });
+                }
+            }
+            Message::AddToPlaylist(id) => {
+                if let Some(PlaylistDialog::AddTrack { path, error, .. }) = &mut self.playlist_dialog
+                {
+                    match self.library.add_to_playlist(id, path) {
+                        Ok(true) => {
+                            self.playlist_dialog = None;
+                            self.load_playlists();
+                        }
+                        Ok(false) => *error = Some("Der Titel ist schon in dieser Playlist".into()),
+                        Err(e) => *error = Some(format!("{e:#}")),
+                    }
+                }
+            }
+            Message::ConfirmPlaylistDialog => match &mut self.playlist_dialog {
+                Some(PlaylistDialog::New { name, add, error }) => {
+                    match self.library.create_playlist(name) {
+                        Ok(id) => {
+                            if let Some(path) = add {
+                                if let Err(e) = self.library.add_to_playlist(id, path) {
+                                    *error = Some(format!("{e:#}"));
+                                    return Task::none();
+                                }
+                            }
+                            self.playlist_dialog = None;
+                            self.pl_selected = Some(id);
+                            self.load_playlists();
+                        }
+                        Err(e) => *error = Some(e.to_string()),
+                    }
+                }
+                Some(PlaylistDialog::Delete { id, .. }) => {
+                    let id = *id;
+                    if let Err(e) = self.library.delete_playlist(id) {
+                        self.status = Some(format!("Playlist löschen fehlgeschlagen: {e:#}"));
+                    }
+                    self.playlist_dialog = None;
+                    if self.pl_selected == Some(id) {
+                        self.pl_selected = None;
+                    }
+                    self.load_playlists();
+                }
+                _ => {}
+            },
+            Message::RemoveFromPlaylist(path) => {
+                if let Some(id) = self.pl_selected {
+                    if let Err(e) = self.library.remove_from_playlist(id, &path) {
+                        self.status = Some(format!("Entfernen fehlgeschlagen: {e:#}"));
+                    }
+                    self.select_playlist(Some(id));
+                }
+            }
+            Message::PlaylistPaneResized(e) => self.pl_columns.resize(e.split, e.ratio),
             Message::CompPaneResized(e) => self.comp_columns.resize(e.split, e.ratio),
             Message::OpenTagEditor => {
-                if !matches!(self.view, View::Music | View::Compilations)
+                if !matches!(
+                    self.view,
+                    View::Music | View::Compilations | View::Playlists
+                )
                     || self.tag_editor.is_some()
+                    || self.playlist_dialog.is_some()
                 {
                     return Task::none();
                 }
@@ -651,7 +845,7 @@ impl PlayerApp {
             }
             Message::RevealFile(path) => folder::reveal_in_file_manager(&path),
             Message::TabPressed(shift) => {
-                if self.tag_editor.is_some() {
+                if self.tag_editor.is_some() || self.playlist_dialog.is_some() {
                     return if shift {
                         iced::widget::operation::focus_previous()
                     } else {
@@ -901,6 +1095,7 @@ impl PlayerApp {
             .tracks
             .iter_mut()
             .chain(self.comp_tracks.iter_mut())
+            .chain(self.pl_tracks.iter_mut())
             .chain(self.queue.iter_mut())
             .filter(|t| t.id == ed.track_id)
         {
@@ -926,6 +1121,23 @@ impl PlayerApp {
         self.apply_filter();
     }
 
+    fn load_playlists(&mut self) {
+        self.playlists = self.library.playlists().unwrap_or_default();
+        let keep = self
+            .pl_selected
+            .filter(|id| self.playlists.iter().any(|p| p.id == *id))
+            .or_else(|| self.playlists.first().map(|p| p.id));
+        self.select_playlist(keep);
+    }
+
+    fn select_playlist(&mut self, id: Option<i64>) {
+        self.pl_selected = id;
+        self.pl_tracks = id
+            .map(|id| self.library.playlist_tracks(id).unwrap_or_default())
+            .unwrap_or_default();
+        self.apply_filter();
+    }
+
     fn select_comp_album(&mut self, album: Option<i64>) {
         self.comp_selected_album = album;
         let Some(artist) = self.comp_artist else {
@@ -941,10 +1153,10 @@ impl PlayerApp {
 
     /// Titel der aktuell sichtbaren Ansicht (Quelle für Abspielliste).
     fn visible_tracks(&self) -> &[Track] {
-        if self.view == View::Compilations {
-            &self.comp_tracks
-        } else {
-            &self.tracks
+        match self.view {
+            View::Compilations => &self.comp_tracks,
+            View::Playlists => &self.pl_tracks,
+            _ => &self.tracks,
         }
     }
 
@@ -963,6 +1175,7 @@ impl PlayerApp {
             self.tracks.retain(|t| f.tracks.contains(&t.id));
             self.comp_albums.retain(|a| f.albums.contains(&a.id));
             self.comp_tracks.retain(|t| f.tracks.contains(&t.id));
+            self.pl_tracks.retain(|t| f.tracks.contains(&t.id));
         }
     }
 
@@ -1076,6 +1289,7 @@ impl PlayerApp {
                         Column::Artists => self.artist_pane(),
                         Column::Albums => self.album_pane(),
                         Column::Tracks => self.track_pane(),
+                        Column::Playlists => unreachable!("nur in der Playlists-Ansicht"),
                     })
                 })
                 .spacing(8)
@@ -1086,6 +1300,7 @@ impl PlayerApp {
                 let content: Element<'_, Message> = match self.view {
                     View::Music => browser.into(),
                     View::Compilations => self.compilations_view(),
+                    View::Playlists => self.playlists_view(),
                     View::MusicBrainz => self.musicbrainz_view(),
                     View::Settings => self.settings_view(),
                 };
@@ -1102,6 +1317,8 @@ impl PlayerApp {
                 });
                 if self.tag_editor.is_some() {
                     stack![main, self.tag_editor_dialog()].into()
+                } else if self.playlist_dialog.is_some() {
+                    stack![main, self.playlist_dialog_view()].into()
                 } else {
                     main.into()
                 }
@@ -1183,6 +1400,11 @@ impl PlayerApp {
                 ICON_COMPILATIONS,
                 "Compilations",
                 Message::ShowView(View::Compilations)
+            ),
+            entry(
+                ICON_PLAYLISTS,
+                "Playlists",
+                Message::ShowView(View::Playlists)
             ),
             entry(
                 ICON_HEXAGON,
@@ -1464,6 +1686,7 @@ impl PlayerApp {
             &self.tracks,
             compilation,
             compilation || self.selected_album.is_none(),
+            false,
         )
     }
 
@@ -1473,6 +1696,7 @@ impl PlayerApp {
         tracks: &'a [Track],
         show_artist: bool,
         show_album: bool,
+        removable: bool,
     ) -> Element<'a, Message> {
         let playing_id = self.current_track().map(|t| t.id);
         fn dash(o: &Option<String>) -> &str {
@@ -1480,12 +1704,19 @@ impl PlayerApp {
         }
 
         let list = column(tracks.iter().enumerate().map(|(i, t)| {
-            let number = t
-                .track_no
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "—".to_string());
+            // Fehlender Pfad (Playlist): ⚠ statt Nummer
+            let number = if t.missing {
+                text("⚠").color(WARN)
+            } else {
+                text(
+                    t.track_no
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "—".to_string()),
+                )
+                .color(DIM)
+            };
             let mut r = row![
-                container(text(number).color(DIM)).width(32),
+                container(number).width(32),
                 cell(&t.title).width(Length::FillPortion(3)),
             ]
             .spacing(8)
@@ -1497,6 +1728,11 @@ impl PlayerApp {
                 r = r.push(cell(dash(&t.album_tag)).width(Length::FillPortion(2)));
             }
             r = r.push(text(fmt_time(t.duration_secs as u64)).color(DIM));
+            if removable {
+                r = r.push(
+                    small_x_button(Message::RemoveFromPlaylist(t.path.clone())),
+                );
+            }
 
             list_button(r.into(), playing_id == Some(t.id), Message::PlayTrack(i))
         }));
@@ -1509,11 +1745,122 @@ impl PlayerApp {
         pane("TITEL", list.into())
     }
 
+    /// Modale Playlist-Dialoge (Neu / Hinzufügen / Löschen).
+    fn playlist_dialog_view(&self) -> Element<'_, Message> {
+        let Some(dialog) = &self.playlist_dialog else {
+            return container(text("")).into();
+        };
+        let err = err_text;
+        let content: Element<'_, Message> = match dialog {
+            PlaylistDialog::New { name, error, .. } => column![
+                text("Neue Playlist").size(20),
+                text_input("Name", name)
+                    .id(PLAYLIST_NAME_FIELD)
+                    .on_input(Message::PlaylistName)
+                    .on_submit(Message::ConfirmPlaylistDialog)
+                    .padding(6),
+                err(error),
+                row![
+                    button("Abbrechen").on_press(Message::ClosePlaylistDialog),
+                    button("Anlegen").on_press(Message::ConfirmPlaylistDialog),
+                ]
+                .spacing(8),
+            ]
+            .spacing(10)
+            .into(),
+            PlaylistDialog::AddTrack { title, error, .. } => {
+                let list: Element<'_, Message> = if self.playlists.is_empty() {
+                    column![].into()
+                } else {
+                    scrollable(column(self.playlists.iter().map(|p| {
+                        list_button(
+                            text(p.name.as_str()).wrapping(Wrapping::None).into(),
+                            false,
+                            Message::AddToPlaylist(p.id),
+                        )
+                    })))
+                    .height(Length::Shrink)
+                    .into()
+                };
+                column![
+                    text("Zu Playlist hinzufügen").size(20),
+                    text(title.as_str()).size(12).color(DIM),
+                    container(list).max_height(260),
+                    button("+ Neue Playlist …").on_press(Message::AddToNewPlaylist),
+                    err(error),
+                    button("Abbrechen").on_press(Message::ClosePlaylistDialog),
+                ]
+                .spacing(10)
+                .into()
+            }
+            PlaylistDialog::Delete { name, .. } => column![
+                text(format!("Playlist „{name}“ löschen?")).size(20),
+                text("Die Titeldateien bleiben erhalten.").size(13).color(DIM),
+                row![
+                    button("Abbrechen").on_press(Message::ClosePlaylistDialog),
+                    button("Löschen").on_press(Message::ConfirmPlaylistDialog),
+                ]
+                .spacing(8),
+            ]
+            .spacing(10)
+            .into(),
+        };
+        modal(
+            container(content)
+                .padding(20)
+                .max_width(460)
+                .style(panel_style)
+                .into(),
+            Message::ClosePlaylistDialog,
+        )
+    }
+
+    /// Playlists: zwei Spalten (Playlist | Titel).
+    fn playlists_view(&self) -> Element<'_, Message> {
+        pane_grid(&self.pl_columns, |_, kind, _| {
+            pane_grid::Content::new(match kind {
+                Column::Tracks => self.track_list(&self.pl_tracks, true, true, true),
+                _ => {
+                    let list: Element<'_, Message> = if self.playlists.is_empty() {
+                        column![].into()
+                    } else {
+                        column(self.playlists.iter().map(|p| {
+                            list_button(
+                                row![
+                                    text(p.name.as_str())
+                                        .wrapping(Wrapping::None)
+                                        .width(Length::Fill),
+                                    small_x_button(Message::AskDeletePlaylist(p.id)),
+                                ]
+                                .align_y(Alignment::Center)
+                                .into(),
+                                self.pl_selected == Some(p.id),
+                                Message::SelectPlaylist(p.id),
+                            )
+                        }))
+                        .into()
+                    };
+                    let content = column![
+                        button("+ Neue Playlist").on_press(Message::NewPlaylist),
+                        list
+                    ]
+                    .spacing(8);
+                    pane("PLAYLIST", content.into())
+                }
+            })
+        })
+        .spacing(8)
+        .min_size(120)
+        .on_resize(6, Message::PlaylistPaneResized)
+        .height(Length::Fill)
+        .into()
+    }
+
     /// Compilations: zwei Spalten (Alben des Künstlers „Compilations“ | Titel).
     fn compilations_view(&self) -> Element<'_, Message> {
         pane_grid(&self.comp_columns, |_, kind, _| {
             pane_grid::Content::new(match kind {
-                Column::Tracks => self.track_list(&self.comp_tracks, true, true),
+                Column::Tracks => self.track_list(&self.comp_tracks, true, true, false),
                 _ => {
                     let all = list_button(
                         text("Alle Alben").into(),
@@ -1640,6 +1987,9 @@ impl PlayerApp {
 /// Name des Sammel-Künstlers (Ordner „Compilations“) – eigene Ansicht
 const COMPILATIONS: &str = "Compilations";
 
+/// ID des Namensfeldes im „Neue Playlist“-Dialog
+const PLAYLIST_NAME_FIELD: &str = "playlist-name";
+
 /// ID des ersten Feldes im Tag-Editor (Fokus beim Öffnen)
 const TAG_FIRST_FIELD: &str = "tag-editor-title";
 
@@ -1657,6 +2007,7 @@ const ICON_SPINNER: &[u8] = include_bytes!("../assets/icons/loader-circle.svg");
 const ICON_MUSIC: &[u8] = include_bytes!("../assets/icons/music.svg");
 const ICON_HEXAGON: &[u8] = include_bytes!("../assets/icons/hexagon.svg");
 const ICON_COMPILATIONS: &[u8] = include_bytes!("../assets/icons/list-music.svg");
+const ICON_PLAYLISTS: &[u8] = include_bytes!("../assets/icons/list-ordered.svg");
 const ICON_SETTINGS: &[u8] = include_bytes!("../assets/icons/settings.svg");
 
 /// Einfarbiges SVG-Icon (Lucide-Icons nutzen `currentColor`, daher Farbfilter).
@@ -1728,6 +2079,45 @@ fn list_button<'a>(
                 },
                 ..button::Style::default()
             }
+        })
+        .on_press(on_press)
+        .into()
+}
+
+/// Fehlerzeile in Dialogen (leer, wenn kein Fehler).
+fn err_text(e: &Option<String>) -> Element<'_, Message> {
+    match e {
+        Some(e) => text(e.as_str()).size(13).color(WARN).into(),
+        None => text("").size(1).into(),
+    }
+}
+
+/// Abgedunkelter Hintergrund mit zentriertem Dialog; Klick daneben schließt.
+fn modal<'a>(dialog: Element<'a, Message>, on_close: Message) -> Element<'a, Message> {
+    opaque(
+        mouse_area(
+            container(opaque(dialog))
+                .center(Length::Fill)
+                .style(|_: &Theme| container::Style {
+                    background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.6).into()),
+                    ..container::Style::default()
+                }),
+        )
+        .on_press(on_close),
+    )
+}
+
+/// Kleines „✕“ ohne Rahmen; beim Darüberfahren heller.
+fn small_x_button(on_press: Message) -> Element<'static, Message> {
+    button(text("✕").size(12))
+        .padding([0, 4])
+        .style(|_: &Theme, status| button::Style {
+            text_color: if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                Color::WHITE
+            } else {
+                DIM
+            },
+            ..button::Style::default()
         })
         .on_press(on_press)
         .into()

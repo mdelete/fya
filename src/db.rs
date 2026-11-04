@@ -19,6 +19,12 @@ pub struct Artist {
 }
 
 #[derive(Clone, Debug)]
+pub struct Playlist {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct Album {
     pub id: i64,
     pub title: String,
@@ -38,6 +44,8 @@ pub struct Track {
     pub artist_tag: Option<String>,
     pub album_tag: Option<String>,
     pub compilation: bool,
+    /// Nur Playlists: Pfad steht nicht (mehr) in der Mediathek
+    pub missing: bool,
 }
 
 pub struct Library {
@@ -82,6 +90,18 @@ CREATE TABLE IF NOT EXISTS settings (
     text  TEXT,
     blob  BLOB
 );
+-- Playlists überleben den Scan (der nur tracks/albums/artists neu aufbaut); Titel
+-- werden über den Dateipfad referenziert, nicht über die track-ID.
+CREATE TABLE IF NOT EXISTS playlists (
+    id    INTEGER PRIMARY KEY,
+    name  TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS playlist_tracks (
+    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    position    INTEGER NOT NULL,
+    path        TEXT NOT NULL,
+    PRIMARY KEY (playlist_id, position)
+);
 CREATE INDEX IF NOT EXISTS idx_albums_artist ON albums(artist_id);
 CREATE INDEX IF NOT EXISTS idx_tracks_album  ON tracks(album_id);
 ";
@@ -89,6 +109,7 @@ CREATE INDEX IF NOT EXISTS idx_tracks_album  ON tracks(album_id);
 /// Migration älterer Datenbanken auf das aktuelle Schema.
 /// (Siehe CLAUDE.md: Migrationscode bleibt, bis er ausdrücklich entfernt werden soll.)
 fn migrate(conn: &Connection) -> Result<()> {
+    // playlists/playlist_tracks: neue Tabellen, werden über SCHEMA (IF NOT EXISTS) angelegt.
     // artists.sort_name: neu angelegte Spalte mit den vorhandenen Namen befüllen.
     if add_column(conn, "artists", "sort_name", "TEXT NOT NULL DEFAULT ''")? {
         let names: Vec<(i64, String)> = conn
@@ -331,6 +352,121 @@ impl Library {
         )
     }
 
+    pub fn playlists(&self) -> Result<Vec<Playlist>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT id, name FROM playlists ORDER BY name COLLATE NOCASE")?;
+        let rows = st.query_map([], |r| {
+            Ok(Playlist {
+                id: r.get(0)?,
+                name: r.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Titel einer Playlist in Playlist-Reihenfolge. Pfade, die nicht (mehr) in der
+    /// Mediathek stehen, kommen als Platzhalter mit `missing = true` (negative ID).
+    pub fn playlist_tracks(&self, playlist_id: i64) -> Result<Vec<Track>> {
+        let mut st = self.conn.prepare(
+            "SELECT t.id, pt.path, t.title, t.track_no, t.duration_secs, al.title, ar.name,
+                    t.artist_tag, t.album_tag, t.compilation
+             FROM playlist_tracks pt
+             LEFT JOIN tracks  t  ON t.path = pt.path
+             LEFT JOIN albums  al ON al.id = t.album_id
+             LEFT JOIN artists ar ON ar.id = al.artist_id
+             WHERE pt.playlist_id = ?1 ORDER BY pt.position",
+        )?;
+        let mut out = Vec::new();
+        let mut rows = st.query([playlist_id])?;
+        while let Some(r) = rows.next()? {
+            let path = PathBuf::from(r.get::<_, String>(1)?);
+            let id: Option<i64> = r.get(0)?;
+            out.push(match id {
+                Some(id) => Track {
+                    id,
+                    title: r.get(2)?,
+                    track_no: r.get(3)?,
+                    duration_secs: r.get(4)?,
+                    album_title: r.get(5)?,
+                    artist_name: r.get(6)?,
+                    artist_tag: r.get::<_, Option<String>>(7)?.filter(|s| !s.trim().is_empty()),
+                    album_tag: r.get::<_, Option<String>>(8)?.filter(|s| !s.trim().is_empty()),
+                    compilation: r.get(9)?,
+                    path,
+                    missing: false,
+                },
+                None => Track {
+                    id: -(out.len() as i64) - 1,
+                    title: file_stem(&path),
+                    track_no: None,
+                    duration_secs: 0,
+                    album_title: String::new(),
+                    artist_name: String::new(),
+                    artist_tag: None,
+                    album_tag: None,
+                    compilation: false,
+                    path,
+                    missing: true,
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    /// Legt eine Playlist an (Name eindeutig, ohne Groß-/Kleinschreibung).
+    pub fn create_playlist(&self, name: &str) -> Result<i64> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("Bitte einen Namen eingeben");
+        }
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM playlists WHERE name = ?1 COLLATE NOCASE)",
+            [name],
+            |r| r.get(0),
+        )?;
+        if exists {
+            bail!("Eine Playlist „{name}“ gibt es schon");
+        }
+        self.conn
+            .execute("INSERT INTO playlists(name) VALUES (?1)", [name])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn delete_playlist(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM playlist_tracks WHERE playlist_id = ?1", [id])?;
+        self.conn.execute("DELETE FROM playlists WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Hängt einen Titel (per Pfad) ans Ende an. Rückgabe: false, wenn er schon enthalten ist.
+    pub fn add_to_playlist(&self, id: i64, path: &Path) -> Result<bool> {
+        let path = path.to_string_lossy();
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM playlist_tracks WHERE playlist_id = ?1 AND path = ?2)",
+            params![id, path],
+            |r| r.get(0),
+        )?;
+        if exists {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "INSERT INTO playlist_tracks(playlist_id, position, path)
+             VALUES (?1, COALESCE((SELECT MAX(position) + 1 FROM playlist_tracks WHERE playlist_id = ?1), 0), ?2)",
+            params![id, path],
+        )?;
+        Ok(true)
+    }
+
+    pub fn remove_from_playlist(&self, id: i64, path: &Path) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id = ?1 AND path = ?2",
+            params![id, path.to_string_lossy()],
+        )?;
+        Ok(())
+    }
+
     pub fn tracks_by_artist(&self, artist_id: i64) -> Result<Vec<Track>> {
         self.query_tracks(
             &format!(
@@ -361,6 +497,7 @@ impl Library {
                     .get::<_, Option<String>>(8)?
                     .filter(|s| !s.trim().is_empty()),
                 compilation: r.get(9)?,
+                missing: false,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -854,5 +991,35 @@ impl Library {
             ],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod playlist_tests {
+    use super::*;
+
+    #[test]
+    fn playlist_roundtrip_mit_fehlendem_pfad() {
+        let dir = std::env::temp_dir().join(format!("fya-pl-test-{}", std::process::id()));
+        let lib = Library::open(&dir.join("library.db")).unwrap();
+
+        let id = lib.create_playlist("  Mix  ").unwrap();
+        assert!(lib.create_playlist("mix").is_err(), "Name eindeutig (NOCASE)");
+        assert!(lib.create_playlist("   ").is_err());
+
+        let p = Path::new("/nicht/vorhanden/a.mp3");
+        assert!(lib.add_to_playlist(id, p).unwrap());
+        assert!(!lib.add_to_playlist(id, p).unwrap(), "Duplikat");
+
+        let tracks = lib.playlist_tracks(id).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert!(tracks[0].missing);
+        assert_eq!(tracks[0].title, "a");
+
+        lib.remove_from_playlist(id, p).unwrap();
+        assert!(lib.playlist_tracks(id).unwrap().is_empty());
+        lib.delete_playlist(id).unwrap();
+        assert!(lib.playlists().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
