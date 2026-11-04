@@ -1,0 +1,40 @@
+[package]
+name = "fya"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+iced = { version = "0.14", features = ["tokio", "svg", "image"] }
+tokio = { version = "1", features = ["rt", "sync"] }
+# Nativer Ordner-Dialog: macOS = NSOpenPanel, Linux = XDG Desktop Portal
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+lofty = "0.22"
+rodio = { version = "0.21", default-features = false, features = [
+    "playback",
+    "symphonia-mp3",
+    "symphonia-aac",
+    "symphonia-isomp4",
+] }
+# Opus: symphonia kann Opus nur demuxen, daher separat dekodiert
+ogg = "0.9"
+opus-rs = "0.1"
+anyhow = "1"
+dirs = "6"
+ureq = { version = "3", features = ["json"] }
+serde_json = "1.0.154"
+log = "0.4.35"
+env_logger = "0.11.11"
+
+# macOS: Security-Scoped Bookmarks (App Sandbox)
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSData", "NSError", "NSArray"] }
+objc2-app-kit = { version = "0.3", features = ["NSOpenPanel", "NSSavePanel", "NSApplication", "NSImage", "NSResponder"] }
+dispatch2 = "0.3"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

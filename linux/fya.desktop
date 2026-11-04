@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FYA
+Comment=Musikplayer
+Exec=fya
+Icon=fya
+Categories=AudioVideo;Audio;Player;
+StartupWMClass=fya
+Terminal=false

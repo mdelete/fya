@@ -1,0 +1,682 @@
+//! SQLite-Mediendatenbank: Schema, Scan der Ordnerstruktur, Abfragen.
+
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OptionalExtension, params};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use lofty::config::WriteOptions;
+use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt};
+
+/// Dateiendungen, die als Song erkannt werden (`m4a` = AAC im MP4-Container).
+pub const AUDIO_EXTENSIONS: &[&str] = &["mp3", "aac", "m4a", "opus"];
+
+#[derive(Clone, Debug)]
+pub struct Artist {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Album {
+    pub id: i64,
+    pub title: String,
+    pub year: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Track {
+    pub id: i64,
+    pub path: PathBuf,
+    pub title: String,
+    pub track_no: Option<u32>,
+    pub duration_secs: u32,
+    pub album_title: String,
+    pub artist_name: String,
+    /// Tags der Datei (None = nicht vorhanden)
+    pub artist_tag: Option<String>,
+    pub album_tag: Option<String>,
+    pub compilation: bool,
+}
+
+pub struct Library {
+    conn: Connection,
+}
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS artists (
+    id    INTEGER PRIMARY KEY,
+    name  TEXT NOT NULL,
+    sort_name TEXT NOT NULL DEFAULT '',  -- MusicBrainz-Sortierschlüssel, siehe sort_key()
+    mbid  TEXT,  -- MusicBrainz-ID des Künstlers
+    path  TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS albums (
+    id         INTEGER PRIMARY KEY,
+    artist_id  INTEGER NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
+    title      TEXT NOT NULL,
+    year       INTEGER,
+    mbid       TEXT,  -- MusicBrainz-ID (UUID, Textform)
+    path       TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS tracks (
+    id             INTEGER PRIMARY KEY,
+    album_id       INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+    path           TEXT NOT NULL UNIQUE,
+    format         TEXT NOT NULL,
+    title          TEXT NOT NULL,
+    artist_tag     TEXT,
+    album_tag      TEXT,
+    track_no       INTEGER,
+    track_total    INTEGER,
+    album_artist_tag TEXT,
+    composer       TEXT,
+    compilation    INTEGER NOT NULL DEFAULT 0,
+    disc_no        INTEGER NOT NULL DEFAULT 1,
+    year           INTEGER,
+    duration_secs  INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    text  TEXT,
+    blob  BLOB
+);
+CREATE INDEX IF NOT EXISTS idx_albums_artist ON albums(artist_id);
+CREATE INDEX IF NOT EXISTS idx_tracks_album  ON tracks(album_id);
+";
+
+/// Migration älterer Datenbanken auf das aktuelle Schema.
+/// (Siehe CLAUDE.md: Migrationscode bleibt, bis er ausdrücklich entfernt werden soll.)
+fn migrate(conn: &Connection) -> Result<()> {
+    // artists.sort_name: neu angelegte Spalte mit den vorhandenen Namen befüllen.
+    if add_column(conn, "artists", "sort_name", "TEXT NOT NULL DEFAULT ''")? {
+        let names: Vec<(i64, String)> = conn
+            .prepare("SELECT id, name FROM artists")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, name) in names {
+            conn.execute(
+                "UPDATE artists SET sort_name = ?1 WHERE id = ?2",
+                params![sort_key(&name), id],
+            )?;
+        }
+    }
+    // artists.mbid: neu; Werte kommen aus musicbrainz.db (nach dem nächsten Scan/Abgleich).
+    add_column(conn, "artists", "mbid", "TEXT")?;
+    Ok(())
+}
+
+/// Fügt die Spalte hinzu, falls sie fehlt. Rückgabe: wurde sie neu angelegt?
+fn add_column(conn: &Connection, table: &str, column: &str, def: &str) -> Result<bool> {
+    let exists = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|c| c == column);
+    if exists {
+        return Ok(false);
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {def}"),
+        [],
+    )?;
+    Ok(true)
+}
+
+const TRACK_SELECT: &str = "
+SELECT t.id, t.path, t.title, t.track_no, t.duration_secs, al.title, ar.name,
+       t.artist_tag, t.album_tag, t.compilation
+FROM tracks t
+JOIN albums  al ON al.id = t.album_id
+JOIN artists ar ON ar.id = al.artist_id";
+
+/// Vom Ordner-Dialog gewählter Musikordner, in der DB gespeichert.
+#[derive(Clone, Debug)]
+pub struct MusicRoot {
+    pub path: PathBuf,
+    /// macOS: Security-Scoped Bookmark, damit die Sandbox den Ordner nach einem
+    /// Neustart wieder freigibt.
+    pub bookmark: Option<Vec<u8>>,
+}
+
+/// Baut die Mediathek aus `root/<artist>/<album>/<song>` neu auf. Öffnet eine
+/// eigene Verbindung und kann deshalb auf einem Worker-Thread laufen.
+/// Rückgabe: Anzahl der Titel.
+pub fn rebuild_from(db_path: &Path, root: &Path) -> Result<usize> {
+    if !root.is_dir() {
+        bail!("Musikordner nicht gefunden: {}", root.display());
+    }
+    let mut conn = Connection::open(db_path)
+        .with_context(|| format!("Datenbank öffnen: {}", db_path.display()))?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+    let n = scan(&mut conn, root)?;
+    // IDs aus musicbrainz.db zurückspielen (die Datei selbst bleibt unangetastet).
+    if let Err(e) = crate::musicbrainz::restore_into(&conn, db_path) {
+        eprintln!("MusicBrainz-IDs konnten nicht zurückgespielt werden: {e:#}");
+    }
+    Ok(n)
+}
+
+fn scan(conn: &mut Connection, root: &Path) -> Result<usize> {
+    // Alles in einer Transaktion: bei einem Fehler bleibt die alte Mediathek.
+    let tx = conn.transaction()?;
+    tx.execute_batch("DELETE FROM tracks; DELETE FROM albums; DELETE FROM artists;")?;
+    let mut n_tracks = 0usize;
+
+    for artist_dir in sorted_entries(root, |p| p.is_dir())? {
+        let artist_name = file_name(&artist_dir);
+        tx.execute(
+            "INSERT INTO artists(name, sort_name, path) VALUES (?1, ?2, ?3)",
+            params![
+                artist_name,
+                sort_key(&artist_name),
+                artist_dir.to_string_lossy()
+            ],
+        )?;
+        let artist_id = tx.last_insert_rowid();
+        eprintln!("  {artist_name}");
+
+        for album_dir in sorted_entries(&artist_dir, |p| p.is_dir())? {
+            let files = sorted_entries(&album_dir, is_audio_file)?;
+            if files.is_empty() {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO albums(artist_id, title, path) VALUES (?1, ?2, ?3)",
+                params![
+                    artist_id,
+                    file_name(&album_dir),
+                    album_dir.to_string_lossy()
+                ],
+            )?;
+            let album_id = tx.last_insert_rowid();
+
+            for file in files {
+                let mut meta = read_meta(&file);
+                fill_tags_from_filename(&file, &mut meta);
+                let format = extension(&file);
+                let title = meta.title.clone().unwrap_or_else(|| file_stem(&file));
+                tx.execute(
+                    "INSERT INTO tracks(album_id, path, format, title, artist_tag, album_tag,
+                                        album_artist_tag, composer, track_no, track_total,
+                                        compilation, disc_no, year, duration_secs)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    params![
+                        album_id,
+                        file.to_string_lossy(),
+                        format,
+                        title,
+                        meta.artist,
+                        meta.album,
+                        meta.album_artist,
+                        meta.composer,
+                        meta.track_no,
+                        meta.track_total,
+                        meta.compilation,
+                        meta.disc_no.unwrap_or(1),
+                        meta.year,
+                        meta.duration_secs,
+                    ],
+                )?;
+                if let Some(year) = meta.year {
+                    tx.execute(
+                        "UPDATE albums SET year = ?1 WHERE id = ?2 AND year IS NULL",
+                        params![year, album_id],
+                    )?;
+                }
+                n_tracks += 1;
+            }
+        }
+    }
+
+    // Künstler-Ordner ohne verwertbare Alben wieder entfernen.
+    tx.execute(
+        "DELETE FROM artists WHERE id NOT IN (SELECT artist_id FROM albums)",
+        [],
+    )?;
+    tx.commit()?;
+    eprintln!("Scan fertig: {n_tracks} Titel.");
+    Ok(n_tracks)
+}
+
+impl Library {
+    /// Öffnet die Datenbank; Datei und Schema werden bei Bedarf angelegt.
+    /// Befüllt wird sie erst, nachdem im Ordner-Dialog ein Musikordner
+    /// gewählt wurde (siehe [`rebuild_from`]).
+    pub fn open(db_path: &Path) -> Result<Self> {
+        if let Some(parent) = db_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(db_path)
+            .with_context(|| format!("Datenbank öffnen: {}", db_path.display()))?;
+        conn.pragma_update(None, "foreign_keys", true)?;
+        conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
+        Ok(Library { conn })
+    }
+
+    /// Der zuletzt gewählte Musikordner (Ergebnis des Ordner-Dialogs).
+    pub fn music_root(&self) -> Result<Option<MusicRoot>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT text, blob FROM settings WHERE key = 'music_root'",
+                [],
+                |r| {
+                    let path: String = r.get(0)?;
+                    Ok(MusicRoot {
+                        path: PathBuf::from(path),
+                        bookmark: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Speichert das Ergebnis des Ordner-Dialogs (Pfad + ggf. Bookmark).
+    pub fn set_music_root(&self, root: &MusicRoot) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings(key, text, blob) VALUES ('music_root', ?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET text = excluded.text, blob = excluded.blob",
+            params![root.path.to_string_lossy(), root.bookmark],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_tracks(&self) -> bool {
+        self.conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM tracks)", [], |r| {
+                r.get::<_, bool>(0)
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn artists(&self) -> Result<Vec<Artist>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT id, name FROM artists ORDER BY sort_name, name")?;
+        let rows = st.query_map([], |r| {
+            Ok(Artist {
+                id: r.get(0)?,
+                name: r.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn albums(&self, artist_id: i64) -> Result<Vec<Album>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, title, year FROM albums WHERE artist_id = ?1
+             ORDER BY COALESCE(year, 9999), title COLLATE NOCASE",
+        )?;
+        let rows = st.query_map([artist_id], |r| {
+            Ok(Album {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                year: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn tracks_by_album(&self, album_id: i64) -> Result<Vec<Track>> {
+        self.query_tracks(
+            &format!(
+                "{TRACK_SELECT} WHERE t.album_id = ?1
+                 ORDER BY t.disc_no, COALESCE(t.track_no, 9999), t.title COLLATE NOCASE"
+            ),
+            album_id,
+        )
+    }
+
+    pub fn tracks_by_artist(&self, artist_id: i64) -> Result<Vec<Track>> {
+        self.query_tracks(
+            &format!(
+                "{TRACK_SELECT} WHERE al.artist_id = ?1
+                 ORDER BY COALESCE(al.year, 9999), al.title COLLATE NOCASE,
+                          t.disc_no, COALESCE(t.track_no, 9999), t.title COLLATE NOCASE"
+            ),
+            artist_id,
+        )
+    }
+
+    fn query_tracks(&self, sql: &str, id: i64) -> Result<Vec<Track>> {
+        let mut st = self.conn.prepare(sql)?;
+        let rows = st.query_map([id], |r| {
+            let path: String = r.get(1)?;
+            Ok(Track {
+                id: r.get(0)?,
+                path: PathBuf::from(path),
+                title: r.get(2)?,
+                track_no: r.get(3)?,
+                duration_secs: r.get(4)?,
+                album_title: r.get(5)?,
+                artist_name: r.get(6)?,
+                artist_tag: r
+                    .get::<_, Option<String>>(7)?
+                    .filter(|s| !s.trim().is_empty()),
+                album_tag: r
+                    .get::<_, Option<String>>(8)?
+                    .filter(|s| !s.trim().is_empty()),
+                compilation: r.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+}
+
+/// Sortierschlüssel nach MusicBrainz-Regeln: führender Artikel ("The", "A",
+/// "An") wird ans Ende gestellt ("The Beatles" -> "beatles, the"), Groß-/
+/// Kleinschreibung ist egal. Angezeigt wird weiter der Originalname.
+fn sort_key(name: &str) -> String {
+    let name = name.trim();
+    let lower = name.to_lowercase();
+    for article in ["the", "an", "a"] {
+        if let Some(rest) = lower.strip_prefix(article) {
+            if rest.starts_with(char::is_whitespace) && !rest.trim().is_empty() {
+                return format!("{}, {article}", rest.trim());
+            }
+        }
+    }
+    lower
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sort_key;
+
+    #[test]
+    fn artist_sorting() {
+        let mut v = vec![
+            "The Beatles",
+            "Aerosmith",
+            "A Tribe Called Quest",
+            "the who",
+            "A-ha",
+            "Beck",
+            "The",
+            "Anthrax",
+        ];
+        v.sort_by_cached_key(|n| sort_key(n));
+        assert_eq!(
+            v,
+            [
+                "A-ha",
+                "Aerosmith",
+                "Anthrax",
+                "The Beatles",
+                "Beck",
+                "The",
+                "A Tribe Called Quest",
+                "the who"
+            ]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metadaten
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Meta {
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    album_artist: Option<String>,
+    composer: Option<String>,
+    track_no: Option<u32>,
+    track_total: Option<u32>,
+    compilation: bool,
+    disc_no: Option<u32>,
+    year: Option<u32>,
+    duration_secs: u32,
+}
+
+/// Liest Tags (ID3v2, ID3v1, MP4-Atome, Vorbis-Comments/OpusTags) und Dauer.
+fn read_meta(path: &Path) -> Meta {
+    let tagged = match lofty::read_from_path(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("    Warnung: {} nicht lesbar ({e})", path.display());
+            return Meta::default();
+        }
+    };
+
+    let mut meta = Meta {
+        duration_secs: tagged.properties().duration().as_secs() as u32,
+        ..Meta::default()
+    };
+
+    if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
+        meta.title = tag
+            .title()
+            .map(|s| s.into_owned())
+            .filter(|s| !s.trim().is_empty());
+        meta.artist = tag.artist().map(|s| s.into_owned());
+        meta.album = tag.album().map(|s| s.into_owned());
+        meta.album_artist = text_item(tag, &ItemKey::AlbumArtist);
+        meta.composer = text_item(tag, &ItemKey::Composer);
+        meta.track_no = tag.track();
+        meta.track_total = tag.track_total();
+        meta.compilation =
+            tag.get(&ItemKey::FlagCompilation)
+                .is_some_and(|item| match item.value() {
+                    ItemValue::Text(t) | ItemValue::Locator(t) => {
+                        matches!(t.trim().to_lowercase().as_str(), "1" | "true" | "yes")
+                    }
+                    ItemValue::Binary(b) => b.first().is_some_and(|&x| x == 1 || x == b'1'),
+                });
+        meta.disc_no = tag.disk();
+        meta.year = tag.year();
+    }
+    meta
+}
+
+/// Hat die Datei weder Titel noch Album noch Künstler, werden diese aus dem
+/// Dateinamen (`ARTIST - TITLE.*` oder `ARTIST - ALBUM - TITLE.*`) gelesen, in
+/// die Datei geschrieben und in `meta` übernommen. Passt kein Schema: nichts tun.
+fn fill_tags_from_filename(path: &Path, meta: &mut Meta) {
+    if meta.title.is_some() || meta.album.is_some() || meta.artist.is_some() {
+        return;
+    }
+    let stem = file_stem(path);
+    let parts: Vec<&str> = stem.split(" - ").map(str::trim).collect();
+    if parts.iter().any(|p| p.is_empty()) {
+        return;
+    }
+    let (artist, album, title) = match parts[..] {
+        [artist, title] => (artist, None, title),
+        [artist, album, title] => (artist, Some(album), title),
+        _ => return,
+    };
+    match write_tags(path, artist, album, title) {
+        Ok(()) => {
+            meta.artist = Some(artist.to_string());
+            meta.album = album.map(str::to_string);
+            meta.title = Some(title.to_string());
+        }
+        Err(e) => eprintln!(
+            "    Warnung: Tags für {} nicht geschrieben ({e})",
+            path.display()
+        ),
+    }
+}
+
+/// Schreibt Künstler, (optional) Album und Titel in die Datei; legt den
+/// Tag-Container an, falls die Datei noch keinen hat. Bestehende andere Tags
+/// bleiben erhalten.
+pub fn write_tags(path: &Path, artist: &str, album: Option<&str>, title: &str) -> Result<()> {
+    let mut tagged = lofty::read_from_path(path)?;
+    if tagged.primary_tag().is_none() && tagged.first_tag().is_none() {
+        let tag_type = tagged.primary_tag_type();
+        tagged.insert_tag(Tag::new(tag_type));
+    }
+    let tag = match tagged.primary_tag_mut() {
+        Some(t) => t,
+        None => tagged.first_tag_mut().context("kein Tag-Container")?,
+    };
+    tag.set_artist(artist.to_string());
+    if let Some(album) = album {
+        tag.set_album(album.to_string());
+    }
+    tag.set_title(title.to_string());
+    tag.save_to_path(path, WriteOptions::default())?;
+    Ok(())
+}
+
+/// Eingebettetes Cover (ID3 APIC, MP4 covr, Vorbis/Opus PICTURE): bevorzugt das
+/// Frontcover, sonst das erste Bild. Rohbytes (JPEG/PNG …).
+pub fn read_cover(path: &Path) -> Option<Vec<u8>> {
+    use lofty::picture::PictureType;
+    let tagged = lofty::read_from_path(path).ok()?;
+    let pictures: Vec<_> = tagged.tags().iter().flat_map(|t| t.pictures()).collect();
+    pictures
+        .iter()
+        .find(|p| p.pic_type() == PictureType::CoverFront)
+        .or_else(|| pictures.first())
+        .map(|p| p.data().to_vec())
+}
+
+fn text_item(tag: &lofty::tag::Tag, key: &ItemKey) -> Option<String> {
+    tag.get_string(key)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// Dateisystem-Helfer
+// ---------------------------------------------------------------------------
+
+fn sorted_entries(dir: &Path, keep: impl Fn(&Path) -> bool) -> Result<Vec<PathBuf>> {
+    let mut v: Vec<PathBuf> = fs::read_dir(dir)
+        .with_context(|| format!("Verzeichnis lesen: {}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        // versteckte Einträge (".DS_Store", "._foo.mp3" …) ignorieren
+        .filter(|p| !file_name(p).starts_with('.'))
+        .filter(|p| keep(p))
+        .collect();
+    v.sort_by_key(|p| file_name(p).to_lowercase());
+    Ok(v)
+}
+
+fn is_audio_file(p: &Path) -> bool {
+    p.is_file() && AUDIO_EXTENSIONS.contains(&extension(p).as_str())
+}
+
+fn extension(p: &Path) -> String {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn file_stem(p: &Path) -> String {
+    p.file_stem()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Treffer einer Suche (IDs der sichtbaren Künstler/Alben/Titel).
+#[derive(Debug, Clone, Default)]
+pub struct SearchHits {
+    pub artists: std::collections::HashSet<i64>,
+    pub albums: std::collections::HashSet<i64>,
+    pub tracks: std::collections::HashSet<i64>,
+}
+
+/// Sucht `query` (ohne Groß-/Kleinschreibung) in Künstler, Album und Titel.
+/// Passt der Künstler, sind alle seine Alben und Titel sichtbar; sonst nur
+/// passende Alben/Titel (samt ihrem Album bzw. Künstler als Zugang).
+/// Eigene Verbindung, läuft auf einem Worker-Thread. Bricht ab (None), sobald
+/// `generation` nicht mehr `my_generation` ist (neuere Eingabe).
+pub fn search(
+    db_path: &Path,
+    query: &str,
+    generation: &std::sync::atomic::AtomicU64,
+    my_generation: u64,
+) -> Result<Option<SearchHits>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let q = query.to_lowercase();
+    let hit = |s: &str| s.to_lowercase().contains(&q);
+
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("Datenbank öffnen: {}", db_path.display()))?;
+    let mut st = conn.prepare(
+        "SELECT ar.id, ar.name, al.id, al.title, t.id, t.title, t.artist_tag, t.album_tag
+         FROM albums al
+         JOIN artists ar ON ar.id = al.artist_id
+         LEFT JOIN tracks t ON t.album_id = al.id",
+    )?;
+    let mut rows = st.query([])?;
+
+    // Erst Treffer sammeln, Künstlertreffer danach auffüllen.
+    let mut hits = SearchHits::default();
+    let mut all: Vec<(i64, i64, Option<i64>)> = Vec::new(); // (artist, album, track)
+    let mut artist_match = std::collections::HashSet::new();
+    let mut n = 0u32;
+    while let Some(r) = rows.next()? {
+        n += 1;
+        if n % 512 == 0 && generation.load(Relaxed) != my_generation {
+            return Ok(None);
+        }
+        let (ar_id, ar_name): (i64, String) = (r.get(0)?, r.get(1)?);
+        let (al_id, al_title): (i64, String) = (r.get(2)?, r.get(3)?);
+        let t_id: Option<i64> = r.get(4)?;
+        let t_title: Option<String> = r.get(5)?;
+        let t_artist: Option<String> = r.get(6)?;
+        let t_album: Option<String> = r.get(7)?;
+        all.push((ar_id, al_id, t_id));
+
+        if hit(&ar_name) {
+            artist_match.insert(ar_id);
+        }
+        let album_hit = hit(&al_title) || t_album.as_deref().is_some_and(&hit);
+        let track_hit =
+            t_title.as_deref().is_some_and(&hit) || t_artist.as_deref().is_some_and(&hit);
+        if album_hit {
+            hits.albums.insert(al_id);
+            hits.artists.insert(ar_id);
+        }
+        if let (true, Some(t)) = (track_hit || album_hit, t_id) {
+            hits.tracks.insert(t);
+            hits.albums.insert(al_id);
+            hits.artists.insert(ar_id);
+        }
+    }
+    for (ar, al, t) in all {
+        if artist_match.contains(&ar) {
+            hits.artists.insert(ar);
+            hits.albums.insert(al);
+            hits.tracks.extend(t);
+        }
+    }
+    Ok(Some(hits))
+}
+
+/// Setzt den aktuellen Thread auf niedrige Priorität (Hintergrund).
+pub fn lower_thread_priority() {
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+    }
+    // macOS: PRIO_DARWIN_THREAD (3) + PRIO_DARWIN_BG (0x1000) betrifft nur diesen Thread.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        setpriority(3, 0, 0x1000);
+    }
+    // Linux: PRIO_PROCESS mit who = 0 wirkt auf den aufrufenden Thread.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    unsafe {
+        setpriority(0, 0, 19);
+    }
+}
