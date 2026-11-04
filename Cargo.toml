@@ -17,7 +17,7 @@ rodio = { version = "0.21", default-features = false, features = [
     "symphonia-aac",
     "symphonia-isomp4",
 ] }
-# Opus: symphonia kann Opus nur demuxen, daher separat dekodiert
+# Opus: symphonia kann Opus nur demuxen, daher extra dekoder
 ogg = "0.9"
 opus-rs = "0.1"
 anyhow = "1"

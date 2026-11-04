@@ -1,7 +1,7 @@
 # FYA
 
 Minimaler Musik-Player: Rust + iced, SQLite-Bibliothek, rodio-Wiedergabe.
-Formate: mp3, aac, m4a (AAC), opus (über `opus-rs`).
+Formate: mp3, aac, m4a (AAC), opus (über `opus-rs`). Theme geborgt von [Halloy](https://halloy.chat/).
 
 ## Musikordner
 Wird beim ersten Start im Ordner-Dialog gewählt. Erwartete Struktur:
@@ -76,4 +76,4 @@ Slider unten = Spulen und Lautstärke.
 
 ## Links
 
- * [BPM Analyzer](https://github.com/not-jan/bpm-analyzer)
+ * [BPM Analyzer](https://github.com/not-jan/bpm-analyzer) (nicht eingebaut)
