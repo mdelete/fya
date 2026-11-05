@@ -108,42 +108,10 @@ CREATE INDEX IF NOT EXISTS idx_tracks_album  ON tracks(album_id);
 
 /// Migration älterer Datenbanken auf das aktuelle Schema.
 /// (Siehe CLAUDE.md: Migrationscode bleibt, bis er ausdrücklich entfernt werden soll.)
-fn migrate(conn: &Connection) -> Result<()> {
-    // playlists/playlist_tracks: neue Tabellen, werden über SCHEMA (IF NOT EXISTS) angelegt.
-    // artists.sort_name: neu angelegte Spalte mit den vorhandenen Namen befüllen.
-    if add_column(conn, "artists", "sort_name", "TEXT NOT NULL DEFAULT ''")? {
-        let names: Vec<(i64, String)> = conn
-            .prepare("SELECT id, name FROM artists")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        for (id, name) in names {
-            conn.execute(
-                "UPDATE artists SET sort_name = ?1 WHERE id = ?2",
-                params![sort_key(&name), id],
-            )?;
-        }
-    }
-    // artists.mbid: neu; Werte kommen aus musicbrainz.db (nach dem nächsten Scan/Abgleich).
-    add_column(conn, "artists", "mbid", "TEXT")?;
+/// Derzeit nichts zu tun – bei der nächsten Schemaänderung hier wieder einbauen
+/// (neue Spalten per `ALTER TABLE`, ggf. Daten nachfüllen).
+fn migrate(_conn: &Connection) -> Result<()> {
     Ok(())
-}
-
-/// Fügt die Spalte hinzu, falls sie fehlt. Rückgabe: wurde sie neu angelegt?
-fn add_column(conn: &Connection, table: &str, column: &str, def: &str) -> Result<bool> {
-    let exists = conn
-        .prepare(&format!("PRAGMA table_info({table})"))?
-        .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .iter()
-        .any(|c| c == column);
-    if exists {
-        return Ok(false);
-    }
-    conn.execute(
-        &format!("ALTER TABLE {table} ADD COLUMN {column} {def}"),
-        [],
-    )?;
-    Ok(true)
 }
 
 const TRACK_SELECT: &str = "
@@ -324,18 +292,46 @@ impl Library {
                 name: r.get(1)?,
             })
         })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut artists: Vec<Artist> = rows.collect::<rusqlite::Result<_>>()?;
+        // Anzeigename aus den Tags (Ordnernamen kennen `/ : ?` nicht)
+        let display = artist_display_names(&self.conn)?;
+        for a in &mut artists {
+            if let Some(shown) = display.get(&a.name) {
+                a.name = shown.clone();
+            }
+        }
+        Ok(artists)
     }
 
+    /// Anzeigenamen (Tag) für Künstler-Ordner, siehe [`artist_display_names`].
+    pub fn artist_names(&self) -> Result<std::collections::HashMap<String, String>> {
+        artist_display_names(&self.conn)
+    }
+
+    /// Anzeigetitel (Tag) für Album-Ordner, siehe [`album_display_titles`].
+    pub fn album_titles(&self) -> Result<std::collections::HashMap<(String, String), String>> {
+        album_display_titles(&self.conn)
+    }
+
+    /// Alben eines Künstlers. `title` ist der Anzeigetitel: Ordnernamen können
+    /// `: ? " / …` nicht enthalten (dort steht `_`); stimmt der häufigste Album-Tag
+    /// der Titel bis auf solche Zeichen mit dem Ordnernamen überein, wird der Tag
+    /// angezeigt. Der Schlüssel in der DB (`albums.title`) bleibt der Ordnername.
     pub fn albums(&self, artist_id: i64) -> Result<Vec<Album>> {
         let mut st = self.conn.prepare(
-            "SELECT id, title, year FROM albums WHERE artist_id = ?1
-             ORDER BY COALESCE(year, 9999), title COLLATE NOCASE",
+            "SELECT al.id, al.title, al.year,
+                    (SELECT t.album_tag FROM tracks t
+                      WHERE t.album_id = al.id AND t.album_tag IS NOT NULL AND t.album_tag <> ''
+                      GROUP BY t.album_tag ORDER BY COUNT(*) DESC LIMIT 1)
+             FROM albums al WHERE al.artist_id = ?1
+             ORDER BY COALESCE(al.year, 9999), al.title COLLATE NOCASE",
         )?;
         let rows = st.query_map([artist_id], |r| {
+            let folder: String = r.get(1)?;
+            let tag: Option<String> = r.get(3)?;
             Ok(Album {
                 id: r.get(0)?,
-                title: r.get(1)?,
+                title: display_title(folder, tag),
                 year: r.get(2)?,
             })
         })?;
@@ -771,6 +767,96 @@ fn file_stem(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Anzeigetitel aller Alben: (Künstler-Ordner, Album-Ordner) -> Titel (siehe
+/// [`Library::albums`]). Für MusicBrainz-Abfragen und -Anzeige.
+pub fn album_display_titles(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<(String, String), String>> {
+    let mut st = conn.prepare(
+        "SELECT ar.name, al.title,
+                (SELECT t.album_tag FROM tracks t
+                  WHERE t.album_id = al.id AND t.album_tag IS NOT NULL AND t.album_tag <> ''
+                  GROUP BY t.album_tag ORDER BY COUNT(*) DESC LIMIT 1)
+         FROM albums al JOIN artists ar ON ar.id = al.artist_id",
+    )?;
+    let rows = st.query_map([], |r| {
+        let (artist, folder): (String, String) = (r.get(0)?, r.get(1)?);
+        let tag: Option<String> = r.get(2)?;
+        Ok(((artist, folder.clone()), display_title(folder, tag)))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+#[cfg(test)]
+mod artist_name_tests {
+    use super::*;
+
+    #[test]
+    fn kuenstler_tag_nur_bei_sanitisierten_zeichen() {
+        assert!(tag_matches_folder("AC/DC", "AC_DC"));
+        assert!(tag_matches_folder("R.E.M.", "R.E.M_"));
+        assert!(tag_matches_folder("V.A.S.T.", "V.A.S.T_"));
+        assert!(tag_matches_folder("Then: The Years", "Then_ The Years"));
+        assert!(tag_matches_folder("Sunn O)))", "Sunn O)))"));
+        assert!(!tag_matches_folder("Kanye West feat. Jay-Z", "Kanye West"));
+    }
+}
+
+/// Ersetzt Zeichen, die in Ordnernamen nicht vorkommen dürfen, durch `_`.
+fn sanitize_folder_name(s: &str) -> String {
+    s.chars()
+        .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
+        .collect()
+}
+
+/// Anzeigetitel eines Albums: der Tag, wenn er dem Ordnernamen bis auf
+/// ersetzte Sonderzeichen entspricht, sonst der Ordnername.
+fn display_title(folder: String, tag: Option<String>) -> String {
+    match tag {
+        Some(tag) if tag != folder && tag_matches_folder(&tag, &folder) => tag.trim().to_string(),
+        _ => folder,
+    }
+}
+
+/// Entspricht der Tag dem Ordnernamen bis auf ersetzte Sonderzeichen? Ein
+/// Punkt am Ende (`R.E.M.`) wird in Ordnernamen ebenfalls zu `_` (`R.E.M_`).
+fn tag_matches_folder(tag: &str, folder: &str) -> bool {
+    let (tag, folder) = (tag.trim(), folder.trim());
+    let mut sanitized = sanitize_folder_name(tag);
+    if sanitized.ends_with('.') {
+        sanitized.pop();
+        sanitized.push('_');
+    }
+    sanitized == folder
+        || sanitize_folder_name(tag).trim_end_matches('.') == folder.trim_end_matches('.')
+}
+
+/// Anzeigenamen der Künstler: Ordnername -> Tag-Name (nur wo er abweicht). Gewählt
+/// wird der häufigste Künstler-/Albumkünstler-Tag der Titel, der dem Ordnernamen
+/// bis auf ersetzte Sonderzeichen entspricht (z. B. `AC_DC` -> `AC/DC`).
+pub fn artist_display_names(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut st = conn.prepare(
+        "SELECT ar.name, COALESCE(NULLIF(t.album_artist_tag, ''), NULLIF(t.artist_tag, '')) AS tag,
+                COUNT(*) AS c
+         FROM artists ar
+         JOIN albums al ON al.artist_id = ar.id
+         JOIN tracks t ON t.album_id = al.id
+         WHERE tag IS NOT NULL
+         GROUP BY ar.name, tag ORDER BY c DESC",
+    )?;
+    let mut map = std::collections::HashMap::new();
+    let mut rows = st.query([])?;
+    while let Some(r) = rows.next()? {
+        let (folder, tag): (String, String) = (r.get(0)?, r.get(1)?);
+        if tag != folder && tag_matches_folder(&tag, &folder) {
+            map.entry(folder).or_insert_with(|| tag.trim().to_string());
+        }
+    }
+    Ok(map)
+}
+
 /// Treffer einer Suche (IDs der sichtbaren Künstler/Alben/Titel).
 #[derive(Debug, Clone, Default)]
 pub struct SearchHits {
@@ -1084,5 +1170,24 @@ mod playlist_tests {
         lib.delete_playlist(id).unwrap();
         assert!(lib.playlists().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod display_title_tests {
+    use super::*;
+
+    #[test]
+    fn tag_ersetzt_nur_bei_sanitisierten_sonderzeichen() {
+        let t = |f: &str, tag: Option<&str>| display_title(f.into(), tag.map(Into::into));
+        assert_eq!(
+            t("Secret History_ Best of the Divine Comedy", Some("Secret History: Best of the Divine Comedy")),
+            "Secret History: Best of the Divine Comedy"
+        );
+        assert_eq!(t("Who_s Next_", Some("Who's Next?")), "Who_s Next_"); // ' wird nicht ersetzt -> kein Treffer
+        assert_eq!(t("What_", Some("What?")), "What?");
+        // Abweichender Tag bleibt unberücksichtigt
+        assert_eq!(t("Greatest Hits", Some("Something Else")), "Greatest Hits");
+        assert_eq!(t("Album", None), "Album");
     }
 }

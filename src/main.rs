@@ -359,6 +359,9 @@ struct PlayerApp {
     comp_selected_album: Option<i64>,
     /// Enthält die Mediathek überhaupt Künstler? (unabhängig von Filter/„Compilations“)
     library_empty: bool,
+    /// Anzeigenamen aus den Tags: Künstler-Ordner -> Name, (Künstler-Ordner, Album-Ordner) -> Titel
+    artist_names: std::collections::HashMap<String, String>,
+    album_titles: std::collections::HashMap<(String, String), String>,
 
     /// Playlists-Ansicht
     pl_columns: pane_grid::State<Column>,
@@ -421,6 +424,8 @@ impl PlayerApp {
             comp_tracks: Vec::new(),
             comp_selected_album: None,
             library_empty: true,
+            artist_names: Default::default(),
+            album_titles: Default::default(),
             pl_columns: pane_grid::State::with_configuration(pane_grid::Configuration::Split {
                 axis: pane_grid::Axis::Vertical,
                 ratio: 0.3,
@@ -508,6 +513,8 @@ impl PlayerApp {
     }
 
     fn reload_library_view(&mut self) {
+        self.artist_names = self.library.artist_names().unwrap_or_default();
+        self.album_titles = self.library.album_titles().unwrap_or_default();
         self.artists = self.library.artists().unwrap_or_default();
         self.library_empty = self.artists.is_empty();
         // „Compilations“ hat eine eigene Ansicht und erscheint nicht unter „Music“.
@@ -565,7 +572,10 @@ impl PlayerApp {
             .enumerate()
             .filter(|(_, e)| {
                 query.as_ref().is_none_or(|q| {
-                    e.artist.to_lowercase().contains(q) || e.album.to_lowercase().contains(q)
+                    e.artist.to_lowercase().contains(q)
+                        || e.artist_display.to_lowercase().contains(q)
+                        || e.album.to_lowercase().contains(q)
+                        || e.display.to_lowercase().contains(q)
                 })
             })
             .map(|(i, _)| i)
@@ -1601,8 +1611,8 @@ impl PlayerApp {
                 MbState::Unknown => ("unknown", DIM),
             };
             let r = row![
-                cell(&e.artist).width(Length::FillPortion(1)),
-                cell(&e.album).width(Length::FillPortion(1)),
+                cell(&e.artist_display).width(Length::FillPortion(1)),
+                cell(&e.display).width(Length::FillPortion(1)),
                 // MBID (UUID, 36 Zeichen): fest, klein und schmal; Monospace ≈ 0,6 em/Zeichen
                 text(state)
                     .size(if matches!(e.state, MbState::Id(_)) {
@@ -1983,7 +1993,18 @@ impl PlayerApp {
             (Some(err), _) => (err.clone(), String::new()),
             (None, Some(t)) => (
                 t.title.clone(),
-                format!("{} — {}", t.artist_name, t.album_title),
+                {
+                    // Anzeigenamen aus den Tags statt der (bereinigten) Ordnernamen
+                    let artist = self
+                        .artist_names
+                        .get(&t.artist_name)
+                        .unwrap_or(&t.artist_name);
+                    let album = self
+                        .album_titles
+                        .get(&(t.artist_name.clone(), t.album_title.clone()))
+                        .unwrap_or(&t.album_title);
+                    format!("{artist} — {album}")
+                },
             ),
             (None, None) => ("Kein Titel ausgewählt".to_string(), String::new()),
         };

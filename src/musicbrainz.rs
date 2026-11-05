@@ -47,16 +47,6 @@ fn open_store(path: &Path) -> Result<Connection> {
         Connection::open(path).with_context(|| format!("Datenbank öffnen: {}", path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch(MB_SCHEMA)?;
-    // v1: Künstlerbilder wurden zuvor fälschlich über das Cover Art Archive gesucht
-    // und als „nicht vorhanden“ (leerer BLOB) vermerkt – zurücksetzen.
-    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if version < 1 {
-        conn.execute(
-            "UPDATE artists SET image = NULL WHERE length(image) = 0",
-            [],
-        )?;
-        conn.pragma_update(None, "user_version", 1)?;
-    }
     Ok(conn)
 }
 
@@ -93,7 +83,12 @@ struct Album {
     id: i64,
     artist_id: i64,
     artist: String,
+    /// Ordnername (Schlüssel in beiden Datenbanken)
     title: String,
+    /// Titel für die Abfrage (Album-Tag, siehe `db::album_display_titles`)
+    query_title: String,
+    /// Künstlername für die Abfrage (Tag, siehe `db::artist_display_names`)
+    query_artist: String,
     lib_mbid: Option<String>,
 }
 
@@ -110,6 +105,9 @@ pub fn lookup_missing(
     lib.busy_timeout(Duration::from_secs(5))?;
     let store = open_store(&store_path(db_path))?;
 
+    let display = crate::db::album_display_titles(&lib)?;
+    let artist_display = crate::db::artist_display_names(&lib)?;
+
     let albums: Vec<Album> = {
         let mut st = lib.prepare(
             "SELECT al.id, ar.id, ar.name, al.title, al.mbid FROM albums al
@@ -122,10 +120,25 @@ pub fn lookup_missing(
                 artist_id: r.get(1)?,
                 artist: r.get(2)?,
                 title: r.get(3)?,
+                query_title: String::new(),
+                query_artist: String::new(),
                 lib_mbid: r.get(4)?,
             })
         })?
-        .collect::<rusqlite::Result<_>>()?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|mut a| {
+            a.query_title = display
+                .get(&(a.artist.clone(), a.title.clone()))
+                .cloned()
+                .unwrap_or_else(|| a.title.clone());
+            a.query_artist = artist_display
+                .get(&a.artist)
+                .cloned()
+                .unwrap_or_else(|| a.artist.clone());
+            a
+        })
+        .collect()
     };
     // „Unbekannt“ = noch nicht in musicbrainz.db (oder in library.db ohne mbid).
     // Alben mit mbid in library.db, die in musicbrainz.db fehlen, werden erneut abgefragt.
@@ -184,8 +197,8 @@ pub fn lookup_missing(
         throttle.wait(); // Rate-Limit einhalten
         let query = format!(
             "artist:\"{}\" AND releasegroup:\"{}\"",
-            escape(&al.artist),
-            escape(&al.title)
+            escape(&al.query_artist),
+            escape(&al.query_title)
         );
         log::debug!("GET {ENDPOINT}?query={query}&fmt=json");
 
@@ -327,7 +340,12 @@ pub enum MbState {
 #[derive(Clone, Debug)]
 pub struct AlbumEntry {
     pub artist: String,
+    /// Ordnername (Schlüssel in der Datenbank)
     pub album: String,
+    /// Anzeigetitel (Album-Tag)
+    pub display: String,
+    /// Anzeigename des Künstlers (Tag)
+    pub artist_display: String,
     pub state: MbState,
 }
 
@@ -336,6 +354,9 @@ pub struct AlbumEntry {
 pub fn list_albums(library_db: &Path) -> Result<Vec<AlbumEntry>> {
     let store = open_store(&store_path(library_db))?;
     store.execute("ATTACH DATABASE ?1 AS lib", [library_db.to_string_lossy()])?;
+    let lib_ro = Connection::open_with_flags(library_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let display = crate::db::album_display_titles(&lib_ro)?;
+    let artist_names = crate::db::artist_display_names(&lib_ro)?;
     let mut st = store.prepare(
         "SELECT artist, name, mbid FROM main.albums
           WHERE artist <> 'Compilations' AND name <> 'Unknown Album'
@@ -348,9 +369,15 @@ pub fn list_albums(library_db: &Path) -> Result<Vec<AlbumEntry>> {
     )?;
     let rows = st.query_map([], |r| {
         let mbid: Option<String> = r.get(2)?;
+        let (artist, album): (String, String) = (r.get(0)?, r.get(1)?);
         Ok(AlbumEntry {
-            artist: r.get(0)?,
-            album: r.get(1)?,
+            display: display
+                .get(&(artist.clone(), album.clone()))
+                .cloned()
+                .unwrap_or_else(|| album.clone()),
+            artist_display: artist_names.get(&artist).cloned().unwrap_or_else(|| artist.clone()),
+            artist,
+            album,
             state: match mbid {
                 None => MbState::Unknown,
                 Some(s) if s.is_empty() => MbState::NotAvailable,
