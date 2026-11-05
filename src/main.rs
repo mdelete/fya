@@ -2346,8 +2346,8 @@ fn modal<'a>(dialog: Element<'a, Message>, on_close: Message) -> Element<'a, Mes
 
 /// Kleines Zeichen als Knopf ohne Rahmen; beim Darüberfahren heller.
 fn small_glyph_button(glyph: &'static str, on_press: Message) -> Element<'static, Message> {
-    button(text(glyph).size(12))
-        .padding([0, 4])
+    button(text(glyph).size(18))
+        .padding([2, 6])
         .style(|_: &Theme, status| button::Style {
             text_color: if matches!(status, button::Status::Hovered | button::Status::Pressed) {
                 col().text

@@ -23,7 +23,12 @@ jobs:
             asset: FYA.app.zip
           - os: ubuntu-latest
             target: linux
-            asset: fya-linux.zip
+            asset: fya-linux-amd64.zip
+            bin: fya-linux-amd64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            asset: fya-linux-arm64.zip
+            bin: fya-linux-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -48,9 +53,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cargo build --release
-          cp target/release/fya fya-linux
-          # zip erhält das Ausführungsrecht (anders als der Artefakt-Upload der rohen Datei)
-          zip fya-linux.zip fya-linux
+          cp target/release/fya ${{ matrix.bin }}
+          zip ${{ matrix.asset }} ${{ matrix.bin }}
 
       - name: Build and bundle (macOS)
         if: runner.os == 'macOS'
@@ -89,6 +93,7 @@ jobs:
           files: |
             release-assets/fya-windows.zip
             release-assets/FYA.app.zip
-            release-assets/fya-linux.zip
+            release-assets/fya-linux-amd64.zip
+            release-assets/fya-linux-arm64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
