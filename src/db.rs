@@ -246,6 +246,24 @@ impl Library {
         Ok(Library { conn })
     }
 
+    /// Einfache Einstellung (Textwert) aus der Tabelle `settings`.
+    pub fn setting(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row("SELECT text FROM settings WHERE key = ?1", [key], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings(key, text) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET text = excluded.text",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     /// Der zuletzt gewählte Musikordner (Ergebnis des Ordner-Dialogs).
     pub fn music_root(&self) -> Result<Option<MusicRoot>> {
         Ok(self
@@ -1189,5 +1207,21 @@ mod display_title_tests {
         // Abweichender Tag bleibt unberücksichtigt
         assert_eq!(t("Greatest Hits", Some("Something Else")), "Greatest Hits");
         assert_eq!(t("Album", None), "Album");
+    }
+}
+
+#[cfg(test)]
+mod setting_tests {
+    use super::*;
+
+    #[test]
+    fn setting_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("fya-set-test-{}", std::process::id()));
+        let lib = Library::open(&dir.join("library.db")).unwrap();
+        assert_eq!(lib.setting("theme"), None);
+        lib.set_setting("theme", "Dracula").unwrap();
+        lib.set_setting("theme", "Nord").unwrap();
+        assert_eq!(lib.setting("theme").as_deref(), Some("Nord"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

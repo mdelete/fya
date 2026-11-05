@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, checkbox, column, container, image, mouse_area, opaque, pane_grid, row, scrollable,
-    slider, stack, svg, text, text_input,
+    button, checkbox, column, container, image, mouse_area, opaque, pane_grid, pick_list, row,
+    scrollable, slider, stack, svg, text, text_input,
 };
 use iced::{
     Alignment, Border, Color, Element, Event, Font, Length, Padding, Subscription, Task, Theme,
@@ -84,7 +84,7 @@ fn main() -> anyhow::Result<()> {
     )
     .title("FYA")
     .subscription(PlayerApp::subscription)
-    .theme(|_: &PlayerApp| theme())
+    .theme(|app: &PlayerApp| app.theme.clone())
     .default_font(Font::MONOSPACE)
     .window(window_settings())
     .run()?;
@@ -96,28 +96,133 @@ fn main() -> anyhow::Result<()> {
 // Monospace-Schrift, Titelleiste transparent über dem Inhalt.
 // ---------------------------------------------------------------------------
 
-const BG: Color = Color::from_rgb(0.145, 0.141, 0.165); // Fenster
-const PANEL: Color = Color::from_rgb(0.122, 0.118, 0.141); // Flächen
-const SELECTED: Color = Color::from_rgb(0.098, 0.094, 0.114); // gewählte Zeile
-const HOVER: Color = Color::from_rgb(0.175, 0.170, 0.196);
-const BORDER: Color = Color::from_rgb(0.55, 0.52, 0.53);
-const TEXT: Color = Color::from_rgb(0.94, 0.88, 0.67); // creme
-/// Warnfarbe (Fehler, ⚠)
-const WARN: Color = Color::from_rgb(0.95, 0.62, 0.3);
-const DIM: Color = Color::from_rgb(0.54, 0.49, 0.46); // Überschriften, Zeiten
+/// Farben der eigenen Flächen/Texte. Für das Standard-Theme „Halloy“ die festen Werte,
+/// sonst aus der Palette des gewählten iced-Themes abgeleitet.
+#[derive(Debug, Clone, Copy)]
+struct Colors {
+    panel: Color,    // Flächen
+    selected: Color, // gewählte Zeile
+    hover: Color,
+    border: Color,
+    text: Color,
+    dim: Color, // Überschriften, Zeiten
+    warn: Color,
+}
 
-fn theme() -> Theme {
+const HALLOY_NAME: &str = "Halloy";
+
+fn halloy_theme() -> Theme {
     Theme::custom(
-        "Halloy",
+        HALLOY_NAME,
         iced::theme::Palette {
-            background: BG,
-            text: TEXT,
-            primary: Color::from_rgb(0.84, 0.66, 0.90), // Flieder
+            background: Color::from_rgb(0.145, 0.141, 0.165), // Fenster
+            text: Color::from_rgb(0.94, 0.88, 0.67),          // creme
+            primary: Color::from_rgb(0.84, 0.66, 0.90),       // Flieder
             success: Color::from_rgb(0.66, 0.82, 0.55),
             warning: Color::from_rgb(0.90, 0.75, 0.48),
             danger: Color::from_rgb(0.88, 0.42, 0.46),
         },
     )
+}
+
+/// Alle wählbaren Themes: Halloy (Standard) + die iced-Themes.
+fn theme_options() -> Vec<Theme> {
+    std::iter::once(halloy_theme())
+        .chain(Theme::ALL.iter().cloned())
+        .collect()
+}
+
+/// Relative Helligkeit (WCAG).
+fn luminance(c: Color) -> f32 {
+    let f = |v: f32| {
+        if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b)
+}
+
+fn contrast(a: Color, b: Color) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// Schiebt `fg` Richtung Schwarz/Weiß (je nach Polarität), bis der Kontrast zu
+/// allen `surfaces` mindestens `min` beträgt.
+fn ensure_contrast(fg: Color, surfaces: &[Color], min: f32) -> Color {
+    // Heller als die Flächen -> Richtung Weiß, sonst Richtung Schwarz
+    let avg = surfaces.iter().map(|s| luminance(*s)).sum::<f32>() / surfaces.len() as f32;
+    let target = if luminance(fg) > avg { 1.0 } else { 0.0 };
+    let mut out = fg;
+    for step in 0..=20 {
+        let t = step as f32 / 20.0;
+        out = Color {
+            r: fg.r + (target - fg.r) * t,
+            g: fg.g + (target - fg.g) * t,
+            b: fg.b + (target - fg.b) * t,
+            a: 1.0,
+        };
+        if surfaces.iter().all(|s| contrast(out, *s) >= min) {
+            break;
+        }
+    }
+    out
+}
+
+fn colors_for(theme: &Theme) -> Colors {
+    if theme.to_string() == HALLOY_NAME {
+        return Colors {
+            panel: Color::from_rgb(0.122, 0.118, 0.141),
+            selected: Color::from_rgb(0.098, 0.094, 0.114),
+            hover: Color::from_rgb(0.175, 0.170, 0.196),
+            border: Color::from_rgb(0.55, 0.52, 0.53),
+            text: Color::from_rgb(0.94, 0.88, 0.67),
+            dim: Color::from_rgb(0.54, 0.49, 0.46),
+            warn: Color::from_rgb(0.95, 0.62, 0.3),
+        };
+    }
+    let p = theme.palette();
+    let bg = theme.extended_palette().background.clone();
+    let mix = |a: Color, b: Color, t: f32| Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: 1.0,
+    };
+    let (panel, selected, hover) = (bg.weakest.color, bg.weaker.color, bg.weak.color);
+    let surfaces = [panel, selected, hover];
+    // Lesbarkeit auf allen eigenen Flächen sicherstellen (v. a. bei Solarized/Tokyo Night Light)
+    let text = ensure_contrast(p.text, &surfaces, 4.5);
+    let dim = ensure_contrast(mix(text, p.background, 0.4), &surfaces, 3.0);
+    Colors {
+        panel,
+        selected,
+        hover,
+        border: bg.strong.color,
+        text,
+        dim,
+        warn: ensure_contrast(p.warning, &surfaces, 3.0),
+    }
+}
+
+/// Aktuelle Farben (werden beim Theme-Wechsel gesetzt; Style-Closures und
+/// View-Funktionen lesen sie über [`col`], ohne sie durchreichen zu müssen).
+static COLORS: std::sync::RwLock<Option<Colors>> = std::sync::RwLock::new(None);
+
+fn col() -> Colors {
+    COLORS
+        .read()
+        .ok()
+        .and_then(|c| *c)
+        .unwrap_or_else(|| colors_for(&halloy_theme()))
+}
+
+fn set_colors(theme: &Theme) {
+    if let Ok(mut c) = COLORS.write() {
+        *c = Some(colors_for(theme));
+    }
 }
 
 fn window_settings() -> iced::window::Settings {
@@ -155,9 +260,9 @@ const TITLEBAR_INSET: f32 = 8.0;
 
 fn panel_style(_: &Theme) -> container::Style {
     container::Style {
-        background: Some(PANEL.into()),
+        background: Some(col().panel.into()),
         border: Border {
-            color: BORDER,
+            color: col().border,
             width: 1.0,
             radius: 4.0.into(),
         },
@@ -190,6 +295,7 @@ enum Message {
     /// Album in der Compilations-Ansicht (None = alle)
     SelectCompAlbum(Option<i64>),
     SelectPlaylist(i64),
+    ThemeSelected(Theme),
     /// Taste „p“: Titel zu Playlist hinzufügen
     OpenAddToPlaylist,
     NewPlaylist,
@@ -359,6 +465,9 @@ struct PlayerApp {
     comp_selected_album: Option<i64>,
     /// Enthält die Mediathek überhaupt Künstler? (unabhängig von Filter/„Compilations“)
     library_empty: bool,
+    /// Gewähltes Theme (siehe Einstellungen) und alle Optionen
+    theme: Theme,
+    theme_options: Vec<Theme>,
     /// Anzeigenamen aus den Tags: Künstler-Ordner -> Name, (Künstler-Ordner, Album-Ordner) -> Titel
     artist_names: std::collections::HashMap<String, String>,
     album_titles: std::collections::HashMap<(String, String), String>,
@@ -424,6 +533,8 @@ impl PlayerApp {
             comp_tracks: Vec::new(),
             comp_selected_album: None,
             library_empty: true,
+            theme: halloy_theme(),
+            theme_options: theme_options(),
             artist_names: Default::default(),
             album_titles: Default::default(),
             pl_columns: pane_grid::State::with_configuration(pane_grid::Configuration::Split {
@@ -447,6 +558,13 @@ impl PlayerApp {
             seek_preview: None,
             status: None,
         };
+        // Gespeichertes Theme laden (sonst Halloy)
+        if let Some(name) = app.library.setting("theme") {
+            if let Some(t) = app.theme_options.iter().find(|t| t.to_string() == name) {
+                app.theme = t.clone();
+            }
+        }
+        set_colors(&app.theme);
         let task = app.restore_folder();
         (app, task)
     }
@@ -721,6 +839,13 @@ impl PlayerApp {
             Message::ShowView(view) => self.show_view(view),
             Message::SelectCompAlbum(a) => self.select_comp_album(a),
             Message::SelectPlaylist(id) => self.select_playlist(Some(id)),
+            Message::ThemeSelected(theme) => {
+                set_colors(&theme);
+                if let Err(e) = self.library.set_setting("theme", &theme.to_string()) {
+                    self.status = Some(format!("Theme konnte nicht gespeichert werden: {e:#}"));
+                }
+                self.theme = theme;
+            }
             Message::Escape => {
                 if self.tag_editor.as_ref().is_some_and(|ed| !ed.saving) {
                     self.tag_editor = None;
@@ -1426,7 +1551,7 @@ impl PlayerApp {
         let entry = |glyph: &'static [u8], label: &'static str, on_press: Message| {
             button(
                 row![
-                    icon(glyph, 16.0, TEXT),
+                    icon(glyph, 16.0, col().text),
                     text(label).wrapping(Wrapping::None)
                 ]
                 .spacing(8)
@@ -1442,8 +1567,8 @@ impl PlayerApp {
             .style(|_: &Theme, status| {
                 let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
                 button::Style {
-                    background: Some(if hovered { HOVER } else { PANEL }.into()),
-                    text_color: TEXT,
+                    background: Some(if hovered { col().hover } else { col().panel }.into()),
+                    text_color: col().text,
                     border: Border {
                         radius: 4.0.into(),
                         ..Border::default()
@@ -1463,7 +1588,7 @@ impl PlayerApp {
                     left: 30.0,
                 })
                 .size(13),
-            container(icon(ICON_SEARCH, 14.0, DIM))
+            container(icon(ICON_SEARCH, 14.0, col().dim))
                 .padding(Padding {
                     left: 10.0,
                     ..Padding::ZERO
@@ -1514,7 +1639,7 @@ impl PlayerApp {
             if kind == TagField::Title {
                 input = input.id(TAG_FIRST_FIELD);
             }
-            row![container(text(label).size(13).color(DIM)).width(110), input]
+            row![container(text(label).size(13).color(col().dim)).width(110), input]
                 .spacing(8)
                 .align_y(Alignment::Center)
         };
@@ -1525,7 +1650,7 @@ impl PlayerApp {
                     .on_input(move |v| Message::EditTag(kind, v))
                     .on_submit(Message::SaveTags);
             }
-            row![text(label).size(13).color(DIM), input]
+            row![text(label).size(13).color(col().dim), input]
                 .spacing(8)
                 .align_y(Alignment::Center)
         };
@@ -1545,9 +1670,9 @@ impl PlayerApp {
                         status,
                         button::Status::Hovered | button::Status::Pressed
                     ) {
-                        Color::WHITE
+                        col().text
                     } else {
-                        DIM
+                        col().dim
                     },
                     ..button::Style::default()
                 })
@@ -1606,9 +1731,9 @@ impl PlayerApp {
         let list = column(self.mb_visible.iter().map(|&i| {
             let e = &self.mb_albums[i];
             let (state, color) = match &e.state {
-                MbState::Id(id) => (id.as_str(), TEXT),
-                MbState::NotAvailable => ("n/a", DIM),
-                MbState::Unknown => ("unknown", DIM),
+                MbState::Id(id) => (id.as_str(), col().text),
+                MbState::NotAvailable => ("n/a", col().dim),
+                MbState::Unknown => ("unknown", col().dim),
             };
             let r = row![
                 cell(&e.artist_display).width(Length::FillPortion(1)),
@@ -1646,7 +1771,7 @@ impl PlayerApp {
                     .height(Length::Fill)
                     .content_fit(iced::ContentFit::Contain)
                     .into(),
-                (Some(_), None) => container(icon(ICON_IMAGE, 48.0, DIM))
+                (Some(_), None) => container(icon(ICON_IMAGE, 48.0, col().dim))
                     .center(Length::Fill)
                     .into(),
                 (None, _) => container(text(""))
@@ -1655,7 +1780,7 @@ impl PlayerApp {
                     .into(),
             };
             // Slots teilen sich die Resthöhe; der Knopf darunter bleibt immer sichtbar.
-            column![text(label).size(12).color(DIM), body]
+            column![text(label).size(12).color(col().dim), body]
                 .spacing(6)
                 .height(Length::FillPortion(1))
                 .into()
@@ -1672,7 +1797,7 @@ impl PlayerApp {
             let total = self.mb_progress.total.load(Ordering::Relaxed);
             run = run.push(
                 row![
-                    icon(ICON_SPINNER, 18.0, TEXT)
+                    icon(ICON_SPINNER, 18.0, col().text)
                         .rotation(iced::Rotation::Floating(self.spinner_angle.into())),
                     text(format!("{current}/{total}")).size(13),
                 ]
@@ -1706,7 +1831,7 @@ impl PlayerApp {
     fn settings_view(&self) -> Element<'_, Message> {
         container(
             column![
-                text("EINSTELLUNGEN").size(12).color(DIM),
+                text("EINSTELLUNGEN").size(12).color(col().dim),
                 text("Musikbibliothek").size(12),
                 text(self.root_label()).size(13),
                 row![
@@ -1714,6 +1839,12 @@ impl PlayerApp {
                     button("Neu einlesen").on_press(Message::Rescan),
                 ]
                 .spacing(8),
+                text("Design").size(12),
+                pick_list(
+                    self.theme_options.as_slice(),
+                    Some(&self.theme),
+                    Message::ThemeSelected,
+                ),
             ]
             .spacing(12),
         )
@@ -1784,14 +1915,14 @@ impl PlayerApp {
         let list = column(tracks.iter().enumerate().map(|(i, t)| {
             // Fehlender Pfad (Playlist): ⚠ statt Nummer
             let number = if t.missing {
-                text("⚠").color(WARN)
+                text("⚠").color(col().warn)
             } else {
                 text(
                     t.track_no
                         .map(|n| n.to_string())
                         .unwrap_or_else(|| "—".to_string()),
                 )
-                .color(DIM)
+                .color(col().dim)
             };
             let mut r = row![
                 container(number).width(32),
@@ -1805,7 +1936,7 @@ impl PlayerApp {
             if show_album {
                 r = r.push(cell(dash(&t.album_tag)).width(Length::FillPortion(2)));
             }
-            r = r.push(text(fmt_time(t.duration_secs as u64)).color(DIM));
+            r = r.push(text(fmt_time(t.duration_secs as u64)).color(col().dim));
             if removable {
                 r = r.push(
                     small_x_button(Message::RemoveFromPlaylist(t.path.clone())),
@@ -1878,7 +2009,7 @@ impl PlayerApp {
                 };
                 column![
                     text("Zu Playlist hinzufügen").size(20),
-                    text(title.as_str()).size(12).color(DIM),
+                    text(title.as_str()).size(12).color(col().dim),
                     container(list).max_height(260),
                     button("+ Neue Playlist …").on_press(Message::AddToNewPlaylist),
                     err(error),
@@ -1889,7 +2020,7 @@ impl PlayerApp {
             }
             PlaylistDialog::Delete { name, .. } => column![
                 text(format!("Playlist „{name}“ löschen?")).size(20),
-                text("Die Titeldateien bleiben erhalten.").size(13).color(DIM),
+                text("Die Titeldateien bleiben erhalten.").size(13).color(col().dim),
                 row![
                     button("Abbrechen").on_press(Message::ClosePlaylistDialog),
                     button("Löschen").on_press(Message::ConfirmPlaylistDialog),
@@ -2030,7 +2161,7 @@ impl PlayerApp {
                 text(subtitle).size(12)
             ]
             .width(Length::Fill),
-            icon(ICON_VOLUME, 20.0, DIM),
+            icon(ICON_VOLUME, 20.0, col().dim),
             slider(0.0..=1.0, self.audio.volume(), Message::Volume)
                 .step(0.01 as f32)
                 .width(120),
@@ -2055,15 +2186,15 @@ impl PlayerApp {
                 .height(72)
                 .content_fit(iced::ContentFit::Cover)
                 .into(),
-            None => icon(ICON_IMAGE, 28.0, DIM).into(),
+            None => icon(ICON_IMAGE, 28.0, col().dim).into(),
         };
         let cover = container(cover_content)
             .center(Length::Fixed(72.0))
             .clip(true)
             .style(|_: &Theme| container::Style {
-                background: Some(SELECTED.into()),
+                background: Some(col().selected.into()),
                 border: Border {
-                    color: DIM,
+                    color: col().dim,
                     width: 1.0,
                     radius: 4.0.into(),
                 },
@@ -2132,8 +2263,8 @@ fn icon_button(data: &'static [u8], on_press: Message) -> Element<'static, Messa
             .height(22)
             .style(|_: &Theme, status| svg::Style {
                 color: Some(match status {
-                    svg::Status::Hovered => Color::WHITE,
-                    svg::Status::Idle => TEXT,
+                    svg::Status::Hovered => col().text,
+                    svg::Status::Idle => col().text,
                 }),
             }),
     )
@@ -2147,7 +2278,7 @@ fn icon_button(data: &'static [u8], on_press: Message) -> Element<'static, Messa
 fn pane<'a>(title: &'a str, content: Element<'a, Message>) -> Element<'a, Message> {
     container(
         column![
-            text(title).size(12).color(DIM),
+            text(title).size(12).color(col().dim),
             scrollable(content).height(Length::Fill).width(Length::Fill),
         ]
         .spacing(6),
@@ -2172,13 +2303,13 @@ fn list_button<'a>(
             let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
             button::Style {
                 background: if selected {
-                    Some(SELECTED.into())
+                    Some(col().selected.into())
                 } else if hovered {
-                    Some(HOVER.into())
+                    Some(col().hover.into())
                 } else {
                     None
                 },
-                text_color: TEXT,
+                text_color: col().text,
                 border: Border {
                     radius: 4.0.into(),
                     ..Border::default()
@@ -2193,7 +2324,7 @@ fn list_button<'a>(
 /// Fehlerzeile in Dialogen (leer, wenn kein Fehler).
 fn err_text(e: &Option<String>) -> Element<'_, Message> {
     match e {
-        Some(e) => text(e.as_str()).size(13).color(WARN).into(),
+        Some(e) => text(e.as_str()).size(13).color(col().warn).into(),
         None => text("").size(1).into(),
     }
 }
@@ -2219,9 +2350,9 @@ fn small_glyph_button(glyph: &'static str, on_press: Message) -> Element<'static
         .padding([0, 4])
         .style(|_: &Theme, status| button::Style {
             text_color: if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-                Color::WHITE
+                col().text
             } else {
-                DIM
+                col().dim
             },
             ..button::Style::default()
         })
@@ -2237,4 +2368,26 @@ fn small_x_button(on_press: Message) -> Element<'static, Message> {
 /// Einzeiliger, abgeschnittener Text.
 fn cell(s: &str) -> container::Container<'_, Message> {
     container(text(s).wrapping(Wrapping::None)).clip(true)
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+
+    /// Text und gedimmter Text müssen auf den Flächen jedes Themes lesbar sein.
+    #[test]
+    fn alle_themes_lesbar() {
+        let mut schlecht = Vec::new();
+        for theme in theme_options() {
+            let c = colors_for(&theme);
+            for (name, surface) in [("panel", c.panel), ("selected", c.selected), ("hover", c.hover)] {
+                let (t, d) = (contrast(c.text, surface), contrast(c.dim, surface));
+                if t < 4.0 || d < 2.0 {
+                    schlecht.push(format!("{theme}/{name}: text {t:.1} dim {d:.1}"));
+                }
+            }
+        }
+        assert!(schlecht.is_empty(), "zu geringer Kontrast:\n{}", schlecht.join("\n"));
+        assert_eq!(theme_options().len(), Theme::ALL.len() + 1);
+    }
 }
