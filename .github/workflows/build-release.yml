@@ -17,13 +17,13 @@ jobs:
         include:
           - os: windows-latest
             target: windows-x64
-            asset: fya.exe
+            asset: fya-windows.zip
           - os: macos-latest
             target: macos
             asset: FYA.app.zip
           - os: ubuntu-latest
             target: linux
-            asset: fya-linux
+            asset: fya-linux.zip
 
     steps:
       - uses: actions/checkout@v4
@@ -40,13 +40,17 @@ jobs:
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
-        run: cargo build --release
+        run: |
+          cargo build --release
+          Compress-Archive -Path target/release/fya.exe -DestinationPath fya-windows.zip
 
       - name: Build (Linux)
         if: runner.os == 'Linux'
         run: |
           cargo build --release
           cp target/release/fya fya-linux
+          # zip erhält das Ausführungsrecht (anders als der Artefakt-Upload der rohen Datei)
+          zip fya-linux.zip fya-linux
 
       - name: Build and bundle (macOS)
         if: runner.os == 'macOS'
@@ -57,7 +61,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: fya-${{ matrix.target }}
-          path: ${{ runner.os == 'Windows' && 'target/release/fya.exe' || matrix.asset }}
+          path: ${{ matrix.asset }}
           if-no-files-found: error
 
   release:
@@ -83,8 +87,8 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            release-assets/fya.exe
+            release-assets/fya-windows.zip
             release-assets/FYA.app.zip
-            release-assets/fya-linux
+            release-assets/fya-linux.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
