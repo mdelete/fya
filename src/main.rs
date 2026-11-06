@@ -299,6 +299,9 @@ enum Message {
     SelectCompAlbum(Option<i64>),
     SelectPlaylist(i64),
     ThemeSelected(Theme),
+    /// Einstellung: Mixtapes immer konvertieren (an/aus) bzw. Zielformat
+    MixtapeConvert(bool),
+    MixtapeFormat(mixtape::Format),
     /// Taste „p“: Titel zu Playlist hinzufügen
     OpenAddToPlaylist,
     NewPlaylist,
@@ -314,7 +317,7 @@ enum Message {
     Mixtape(i64),
     /// Gewählter Zielpfad (None = abgebrochen)
     MixtapeTarget(i64, Option<PathBuf>),
-    MixtapeDone(Result<(usize, usize, PathBuf), String>),
+    MixtapeDone(Result<(usize, usize, usize, PathBuf), String>),
     /// Alt+↑ / Alt+↓: laufenden Titel in der Playlist verschieben (-1 / +1)
     MovePlaylistTrack(i32),
     /// Esc: schließt den jeweils offenen Dialog
@@ -479,6 +482,10 @@ struct PlayerApp {
     /// Gewähltes Theme (siehe Einstellungen) und alle Optionen
     theme: Theme,
     theme_options: Vec<Theme>,
+    /// Mixtapes per ffmpeg konvertieren (Einstellung), Zielformat, gefundenes ffmpeg
+    mixtape_convert: bool,
+    mixtape_format: mixtape::Format,
+    ffmpeg: Option<PathBuf>,
     /// Anzeigenamen aus den Tags: Künstler-Ordner -> Name, (Künstler-Ordner, Album-Ordner) -> Titel
     artist_names: std::collections::HashMap<String, String>,
     album_titles: std::collections::HashMap<(String, String), String>,
@@ -541,6 +548,9 @@ impl PlayerApp {
             library_empty: true,
             theme: halloy_theme(),
             theme_options: theme_options(),
+            mixtape_convert: false,
+            mixtape_format: mixtape::Format::Opus,
+            ffmpeg: mixtape::find_ffmpeg(),
             artist_names: Default::default(),
             album_titles: Default::default(),
             pl_columns: pane_grid::State::with_configuration(pane_grid::Configuration::Split {
@@ -572,6 +582,14 @@ impl PlayerApp {
             }
         }
         set_colors(&app.theme);
+        app.mixtape_convert = app.library.setting("mixtape_convert").as_deref() == Some("1");
+        if let Some(f) = app
+            .library
+            .setting("mixtape_format")
+            .and_then(|k| mixtape::Format::from_key(&k))
+        {
+            app.mixtape_format = f;
+        }
         let task = app.restore_folder();
         (app, task)
     }
@@ -870,6 +888,10 @@ impl PlayerApp {
 
             Message::PaneResized(e) => self.columns.resize(e.split, e.ratio),
             Message::ShowView(view) => {
+                if view == View::Settings {
+                    // ffmpeg könnte inzwischen installiert worden sein
+                    self.ffmpeg = mixtape::find_ffmpeg();
+                }
                 self.show_view(view);
                 if view == View::Music {
                     return self.cover_task();
@@ -883,6 +905,21 @@ impl PlayerApp {
                     self.status = Some(format!("Theme konnte nicht gespeichert werden: {e:#}"));
                 }
                 self.theme = theme;
+            }
+            Message::MixtapeConvert(on) => {
+                self.mixtape_convert = on;
+                if let Err(e) = self
+                    .library
+                    .set_setting("mixtape_convert", if on { "1" } else { "0" })
+                {
+                    self.status = Some(format!("Einstellung konnte nicht gespeichert werden: {e:#}"));
+                }
+            }
+            Message::MixtapeFormat(f) => {
+                self.mixtape_format = f;
+                if let Err(e) = self.library.set_setting("mixtape_format", f.key()) {
+                    self.status = Some(format!("Einstellung konnte nicht gespeichert werden: {e:#}"));
+                }
             }
             Message::Escape => {
                 if self.tag_editor.as_ref().is_some_and(|ed| !ed.saving) {
@@ -939,6 +976,17 @@ impl PlayerApp {
                 let Some(p) = self.playlists.iter().find(|p| p.id == id) else {
                     return Task::none();
                 };
+                if self.mixtape_convert {
+                    self.ffmpeg = mixtape::find_ffmpeg();
+                    if self.ffmpeg.is_none() {
+                        self.status = Some(
+                            "Mixtape: Konvertierung ist aktiv, aber ffmpeg wurde nicht gefunden \
+                             (Einstellungen)"
+                                .into(),
+                        );
+                        return Task::none();
+                    }
+                }
                 let default_name = format!("{}.zip", db::sanitize_folder_name(&p.name));
                 return Task::perform(
                     async move {
@@ -964,13 +1012,25 @@ impl PlayerApp {
                         return Task::none();
                     }
                 };
-                self.status = Some(format!("Mixtape „{name}“ wird erstellt …"));
+                // Konvertierung nur, wenn aktiviert und ffmpeg vorhanden (Originale bleiben unberührt)
+                let convert = match (self.mixtape_convert, &self.ffmpeg) {
+                    (true, Some(ffmpeg)) => Some(mixtape::Convert {
+                        ffmpeg: ffmpeg.clone(),
+                        format: self.mixtape_format,
+                    }),
+                    _ => None,
+                };
+                self.status = Some(if convert.is_some() {
+                    format!("Mixtape „{name}“ wird erstellt und konvertiert …")
+                } else {
+                    format!("Mixtape „{name}“ wird erstellt …")
+                });
                 // ZIP schreiben im Hintergrund (viele/große Dateien)
                 return Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            mixtape::create(&target, &name, &files)
-                                .map(|o| (o.written, o.skipped, o.target))
+                            mixtape::create(&target, &name, &files, convert.as_ref())
+                                .map(|o| (o.written, o.skipped, o.converted, o.target))
                                 .map_err(|e| format!("{e:#}"))
                         })
                         .await
@@ -981,18 +1041,19 @@ impl PlayerApp {
             }
             Message::MixtapeDone(res) => {
                 self.status = Some(match res {
-                    Ok((written, skipped, target)) => {
+                    Ok((written, skipped, converted, target)) => {
                         let file = target
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        if skipped == 0 {
-                            format!("Mixtape gespeichert: {file} ({written} Titel)")
-                        } else {
-                            format!(
-                                "Mixtape gespeichert: {file} ({written} Titel, {skipped} nicht gefunden)"
-                            )
+                        let mut extra = String::new();
+                        if converted > 0 {
+                            extra.push_str(&format!(", {converted} konvertiert"));
                         }
+                        if skipped > 0 {
+                            extra.push_str(&format!(", {skipped} nicht gefunden"));
+                        }
+                        format!("Mixtape gespeichert: {file} ({written} Titel{extra})")
                     }
                     Err(e) => format!("Mixtape fehlgeschlagen: {e}"),
                 });
@@ -2037,7 +2098,7 @@ impl PlayerApp {
                 key("Klick auf Titel", "Titel abspielen (die sichtbare Liste ist die Wiedergabeliste)"),
                 key("Suchfeld", "Sucht ab zwei Zeichen in Künstler, Album und Titel"),
                 key("Trennlinien ziehen", "Spaltenbreiten ändern"),
-                key("❣️ (Playlists)", "Mixtape: Playlist als ZIP speichern"),
+                key("❣️ (Playlists)", "Mixtape: Playlist als ZIP speichern (optional per ffmpeg konvertiert, siehe Einstellungen)"),
                 key("✎ / ✕ (Playlists)", "Playlist umbenennen / löschen bzw. Titel entfernen"),
             ]
             .spacing(8),
@@ -2057,6 +2118,31 @@ impl PlayerApp {
         pane("HILFE", content.into())
     }
 
+    /// „Mixtapes immer konvertieren in: [Format]“ – nur aktiv, wenn ffmpeg gefunden wurde.
+    fn mixtape_setting(&self) -> Element<'_, Message> {
+        let available = self.ffmpeg.is_some();
+        let mut checkbox = checkbox(self.mixtape_convert && available)
+            .label("Mixtapes immer konvertieren in:");
+        let mut formats = row![].spacing(10).align_y(Alignment::Center);
+        if available {
+            checkbox = checkbox.on_toggle(Message::MixtapeConvert);
+            formats = formats.push(pick_list(
+                mixtape::Format::ALL,
+                Some(self.mixtape_format),
+                Message::MixtapeFormat,
+            ));
+        } else {
+            // ohne ffmpeg: nicht bedienbar, Format nur anzeigen + Hinweis
+            formats = formats
+                .push(text(self.mixtape_format.to_string()).color(col().dim))
+                .push(text("Benötigt ffmpeg").size(13).color(col().warn));
+        }
+        row![checkbox, formats]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into()
+    }
+
     fn settings_view(&self) -> Element<'_, Message> {
         container(
             column![
@@ -2074,6 +2160,8 @@ impl PlayerApp {
                     Some(&self.theme),
                     Message::ThemeSelected,
                 ),
+                text("Mixtape").size(12),
+                self.mixtape_setting(),
             ]
             .spacing(12),
         )
