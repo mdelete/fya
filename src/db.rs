@@ -15,7 +15,10 @@ pub const AUDIO_EXTENSIONS: &[&str] = &["mp3", "aac", "m4a", "opus"];
 #[derive(Clone, Debug)]
 pub struct Artist {
     pub id: i64,
+    /// Anzeigename (Tag, siehe `artist_display_names`)
     pub name: String,
+    /// Ordnername (Schlüssel)
+    pub folder: String,
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +47,7 @@ pub struct Track {
     pub artist_tag: Option<String>,
     pub album_tag: Option<String>,
     pub compilation: bool,
+    pub album_id: i64,
     /// Nur Playlists: Pfad steht nicht (mehr) in der Mediathek
     pub missing: bool,
 }
@@ -116,7 +120,7 @@ fn migrate(_conn: &Connection) -> Result<()> {
 
 const TRACK_SELECT: &str = "
 SELECT t.id, t.path, t.title, t.track_no, t.duration_secs, al.title, ar.name,
-       t.artist_tag, t.album_tag, t.compilation
+       t.artist_tag, t.album_tag, t.compilation, t.album_id
 FROM tracks t
 JOIN albums  al ON al.id = t.album_id
 JOIN artists ar ON ar.id = al.artist_id";
@@ -240,6 +244,9 @@ impl Library {
         }
         let conn = Connection::open(db_path)
             .with_context(|| format!("Datenbank öffnen: {}", db_path.display()))?;
+        // Kurze Wartezeit: Hält ein Hintergrund-Thread (MusicBrainz, Scan) die Schreibsperre,
+        // soll die Oberfläche nicht lange hängen, sondern schnell eine Meldung zeigen.
+        conn.busy_timeout(std::time::Duration::from_millis(750))?;
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
@@ -308,12 +315,14 @@ impl Library {
             Ok(Artist {
                 id: r.get(0)?,
                 name: r.get(1)?,
+                folder: String::new(),
             })
         })?;
         let mut artists: Vec<Artist> = rows.collect::<rusqlite::Result<_>>()?;
         // Anzeigename aus den Tags (Ordnernamen kennen `/ : ?` nicht)
         let display = artist_display_names(&self.conn)?;
         for a in &mut artists {
+            a.folder = a.name.clone();
             if let Some(shown) = display.get(&a.name) {
                 a.name = shown.clone();
             }
@@ -384,7 +393,7 @@ impl Library {
     pub fn playlist_tracks(&self, playlist_id: i64) -> Result<Vec<Track>> {
         let mut st = self.conn.prepare(
             "SELECT t.id, pt.path, t.title, t.track_no, t.duration_secs, al.title, ar.name,
-                    t.artist_tag, t.album_tag, t.compilation
+                    t.artist_tag, t.album_tag, t.compilation, t.album_id
              FROM playlist_tracks pt
              LEFT JOIN tracks  t  ON t.path = pt.path
              LEFT JOIN albums  al ON al.id = t.album_id
@@ -407,6 +416,7 @@ impl Library {
                     artist_tag: r.get::<_, Option<String>>(7)?.filter(|s| !s.trim().is_empty()),
                     album_tag: r.get::<_, Option<String>>(8)?.filter(|s| !s.trim().is_empty()),
                     compilation: r.get(9)?,
+                    album_id: r.get::<_, Option<i64>>(10)?.unwrap_or(0),
                     path,
                     missing: false,
                 },
@@ -420,6 +430,7 @@ impl Library {
                     artist_tag: None,
                     album_tag: None,
                     compilation: false,
+                    album_id: 0,
                     path,
                     missing: true,
                 },
@@ -529,6 +540,20 @@ impl Library {
         Ok(())
     }
 
+    /// Titel des Künstlers auf Samplern (Ordner „Compilations“): Künstler-Tag
+    /// entspricht Anzeigenamen oder Ordnername (ohne Groß-/Kleinschreibung).
+    pub fn compilation_tracks_for(&self, display: &str, folder: &str) -> Result<Vec<Track>> {
+        self.query_tracks_with(
+            &format!(
+                "{TRACK_SELECT} WHERE ar.name = 'Compilations'
+                   AND (t.artist_tag = ?1 COLLATE NOCASE OR t.artist_tag = ?2 COLLATE NOCASE)
+                 ORDER BY COALESCE(al.year, 9999), al.title COLLATE NOCASE,
+                          t.disc_no, COALESCE(t.track_no, 9999), t.title COLLATE NOCASE"
+            ),
+            params![display, folder],
+        )
+    }
+
     pub fn tracks_by_artist(&self, artist_id: i64) -> Result<Vec<Track>> {
         self.query_tracks(
             &format!(
@@ -541,8 +566,12 @@ impl Library {
     }
 
     fn query_tracks(&self, sql: &str, id: i64) -> Result<Vec<Track>> {
+        self.query_tracks_with(sql, [id])
+    }
+
+    fn query_tracks_with(&self, sql: &str, p: impl rusqlite::Params) -> Result<Vec<Track>> {
         let mut st = self.conn.prepare(sql)?;
-        let rows = st.query_map([id], |r| {
+        let rows = st.query_map(p, |r| {
             let path: String = r.get(1)?;
             Ok(Track {
                 id: r.get(0)?,
@@ -559,6 +588,7 @@ impl Library {
                     .get::<_, Option<String>>(8)?
                     .filter(|s| !s.trim().is_empty()),
                 compilation: r.get(9)?,
+                album_id: r.get(10)?,
                 missing: false,
             })
         })?;
@@ -821,7 +851,7 @@ mod artist_name_tests {
 }
 
 /// Ersetzt Zeichen, die in Ordnernamen nicht vorkommen dürfen, durch `_`.
-fn sanitize_folder_name(s: &str) -> String {
+pub fn sanitize_folder_name(s: &str) -> String {
     s.chars()
         .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
         .collect()
@@ -911,6 +941,9 @@ pub fn search(
     // Erst Treffer sammeln, Künstlertreffer danach auffüllen.
     let mut hits = SearchHits::default();
     let mut all: Vec<(i64, i64, Option<i64>)> = Vec::new(); // (artist, album, track)
+    // Titel in „Compilations“: (Compilations-Künstler-ID, Album, Titel, Künstler-Tag)
+    let mut comp_rows: Vec<(i64, i64, i64, String)> = Vec::new();
+    let mut artist_names: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
     let mut artist_match = std::collections::HashSet::new();
     let mut n = 0u32;
     while let Some(r) = rows.next()? {
@@ -925,6 +958,12 @@ pub fn search(
         let t_artist: Option<String> = r.get(6)?;
         let t_album: Option<String> = r.get(7)?;
         all.push((ar_id, al_id, t_id));
+        artist_names.entry(ar_id).or_insert_with(|| ar_name.clone());
+        if ar_name == "Compilations" {
+            if let (Some(t), Some(tag)) = (t_id, t_artist.as_ref()) {
+                comp_rows.push((ar_id, al_id, t, tag.clone()));
+            }
+        }
 
         if hit(&ar_name) {
             artist_match.insert(ar_id);
@@ -947,6 +986,28 @@ pub fn search(
             hits.artists.insert(ar);
             hits.albums.insert(al);
             hits.tracks.extend(t);
+        }
+    }
+
+    // Sampler: Titel eines Künstlers (über den Künstler-Tag) gehören zu diesem Künstler.
+    // Passt der Künstler oder der Titel selbst, ist der Titel samt Album sichtbar, und der
+    // Künstler erscheint in der Künstlerliste.
+    let find_artist = |tag: &str| -> Option<i64> {
+        artist_names
+            .iter()
+            .filter(|(_, name)| name.as_str() != "Compilations")
+            .find(|(_, name)| tag.eq_ignore_ascii_case(name) || tag_matches_folder(tag, name))
+            .map(|(id, _)| *id)
+    };
+    for (comp_id, al, t, tag) in comp_rows {
+        let Some(artist) = find_artist(&tag) else {
+            continue;
+        };
+        if artist_match.contains(&artist) || hits.tracks.contains(&t) {
+            hits.tracks.insert(t);
+            hits.albums.insert(al);
+            hits.artists.insert(artist);
+            hits.artists.insert(comp_id);
         }
     }
     Ok(Some(hits))
@@ -1222,6 +1283,95 @@ mod setting_tests {
         lib.set_setting("theme", "Dracula").unwrap();
         lib.set_setting("theme", "Nord").unwrap();
         assert_eq!(lib.setting("theme").as_deref(), Some("Nord"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod compilation_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    /// Bibliothek mit „The Prodigy“ (1 Album, 1 Titel) und einem Sampler, auf dem ein
+    /// Prodigy-Titel und ein Titel eines anderen Künstlers liegen.
+    fn fixture(name: &str) -> (Library, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("fya-comp-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lib = Library::open(&dir.join("library.db")).unwrap();
+        let c = &lib.conn;
+        c.execute_batch(
+            "INSERT INTO artists(id, name, sort_name, path) VALUES (1,'The Prodigy','prodigy','/p'), (2,'Compilations','compilations','/c'), (3,'Other','other','/o');
+             INSERT INTO albums(id, artist_id, title, path) VALUES (10,1,'Fat','/p/fat'), (20,2,'Now 1','/c/now1'), (21,2,'Sampler Two','/c/two'), (30,3,'Else','/o/else');
+             INSERT INTO tracks(id, album_id, path, format, title, artist_tag, album_tag) VALUES
+               (100,10,'/p/fat/a.mp3','mp3','Firestarter','The Prodigy','Fat'),
+               (200,20,'/c/now1/a.mp3','mp3','Breathe','the prodigy','Now 1'),
+               (201,20,'/c/now1/b.mp3','mp3','Other Song','Someone Else','Now 1'),
+               (210,21,'/c/two/a.mp3','mp3','Voodoo People','The Prodigy','Sampler Two'),
+               (300,30,'/o/else/a.mp3','mp3','Zzz','Other','Else');",
+        )
+        .unwrap();
+        (lib, dir)
+    }
+
+    #[test]
+    fn sampler_titel_des_kuenstlers() {
+        let (lib, dir) = fixture("tracks");
+        let t = lib.compilation_tracks_for("The Prodigy", "The Prodigy").unwrap();
+        let titles: Vec<_> = t.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["Breathe", "Voodoo People"]); // nur Titel dieses Künstlers
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn suche_beruecksichtigt_sampler() {
+        let (lib, dir) = fixture("search");
+        let gen_ = AtomicU64::new(0);
+        let db = dir.join("library.db");
+
+        // Künstlertreffer: eigene Titel + Sampler-Titel des Künstlers, nicht der andere Titel
+        let h = search(&db, "prod", &gen_, 0).unwrap().unwrap();
+        assert!(h.artists.contains(&1));
+        for t in [100, 200, 210] {
+            assert!(h.tracks.contains(&t), "Titel {t} fehlt");
+        }
+        assert!(!h.tracks.contains(&201) && !h.tracks.contains(&300));
+
+        // Treffer auf Sampler-Album: Künstler auf dem Sampler erscheint mit seinem Titel
+        let h = search(&db, "sampler two", &gen_, 0).unwrap().unwrap();
+        assert!(h.artists.contains(&1) && h.tracks.contains(&210));
+        assert!(!h.tracks.contains(&100));
+        drop(lib);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Hält ein anderer Schreiber die Sperre, scheitert die UI-Verbindung schnell
+    /// (statt Sekunden zu blockieren) und der Fehler ist als „belegt“ erkennbar.
+    #[test]
+    fn gesperrte_db_scheitert_schnell() {
+        let dir = std::env::temp_dir().join(format!("fya-busy-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("library.db");
+        let lib = Library::open(&path).unwrap();
+        let pl = lib.create_playlist("X").unwrap();
+
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let start = Instant::now();
+        let err = lib.add_to_playlist(pl, Path::new("/x.mp3")).unwrap_err();
+        assert!(start.elapsed().as_secs_f32() < 2.0, "blockiert zu lange: {:?}", start.elapsed());
+        assert!(err.chain().any(|c| matches!(
+            c.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(f, _)) if f.code == rusqlite::ErrorCode::DatabaseBusy
+        )));
+        other.execute_batch("COMMIT").unwrap();
+        // danach geht es wieder
+        assert!(lib.add_to_playlist(pl, Path::new("/x.mp3")).unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

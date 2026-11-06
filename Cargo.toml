@@ -26,6 +26,7 @@ ureq = { version = "3", features = ["json"] }
 serde_json = "1.0.154"
 log = "0.4.35"
 env_logger = "0.11.11"
+zip = { version = "9.4.1", default-features = false }
 
 # macOS: Security-Scoped Bookmarks (App Sandbox)
 [target.'cfg(target_os = "macos")'.dependencies]

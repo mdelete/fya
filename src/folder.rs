@@ -238,3 +238,15 @@ pub fn reveal_in_file_manager(path: &Path) {
         let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
     }
 }
+
+/// „Speichern unter …“-Dialog für ein ZIP (macOS: NSSavePanel, Linux: Portal, Windows:
+/// IFileDialog). Rückgabe: gewählter Pfad, None bei Abbruch.
+pub async fn pick_save_zip(title: &str, default_name: &str) -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .set_title(title)
+        .set_file_name(default_name)
+        .add_filter("ZIP", &["zip"])
+        .save_file()
+        .await
+        .map(|h| h.path().to_path_buf())
+}

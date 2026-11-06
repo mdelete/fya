@@ -4,9 +4,11 @@
 mod audio;
 mod db;
 mod folder;
+mod mixtape;
 mod musicbrainz;
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -277,7 +279,8 @@ fn panel_style(_: &Theme) -> container::Style {
 #[derive(Debug, Clone)]
 enum Message {
     SelectArtist(i64),
-    SelectAlbum(Option<i64>),
+    /// Cover der Alben (Album-ID, Bytes) im Hintergrund geladen
+    AlbumCovers(Vec<(i64, Option<Vec<u8>>)>),
     PlayTrack(usize),
     TogglePause,
     Next,
@@ -307,6 +310,11 @@ enum Message {
     RemoveFromPlaylist(PathBuf),
     AskDeletePlaylist(i64),
     AskRenamePlaylist(i64),
+    /// ❣️ „Mixtape“: Playlist als ZIP exportieren – Speichern-Dialog öffnen
+    Mixtape(i64),
+    /// Gewählter Zielpfad (None = abgebrochen)
+    MixtapeTarget(i64, Option<PathBuf>),
+    MixtapeDone(Result<(usize, usize, PathBuf), String>),
     /// Alt+↑ / Alt+↓: laufenden Titel in der Playlist verschieben (-1 / +1)
     MovePlaylistTrack(i32),
     /// Esc: schließt den jeweils offenen Dialog
@@ -456,7 +464,9 @@ struct PlayerApp {
     tracks: Vec<Track>, // aktuell angezeigte Titel
 
     selected_artist: Option<i64>,
-    selected_album: Option<i64>, // None = alle Alben des Künstlers
+    /// Cover der Album-Köpfe (None = keins gefunden); `cover_pending` = Laden läuft
+    album_covers: HashMap<i64, Option<image::Handle>>,
+    cover_pending: HashSet<i64>,
 
     /// Compilations-Ansicht: Alben/Titel des Künstlers „Compilations“
     comp_columns: pane_grid::State<Column>,
@@ -514,14 +524,9 @@ impl PlayerApp {
             search_generation: Arc::new(AtomicU64::new(0)),
             columns: pane_grid::State::with_configuration(pane_grid::Configuration::Split {
                 axis: pane_grid::Axis::Vertical,
-                ratio: 0.22,
+                ratio: 0.25,
                 a: Box::new(pane_grid::Configuration::Pane(Column::Artists)),
-                b: Box::new(pane_grid::Configuration::Split {
-                    axis: pane_grid::Axis::Vertical,
-                    ratio: 0.34,
-                    a: Box::new(pane_grid::Configuration::Pane(Column::Albums)),
-                    b: Box::new(pane_grid::Configuration::Pane(Column::Tracks)),
-                }),
+                b: Box::new(pane_grid::Configuration::Pane(Column::Albums)),
             }),
             comp_columns: pane_grid::State::with_configuration(pane_grid::Configuration::Split {
                 axis: pane_grid::Axis::Vertical,
@@ -552,7 +557,8 @@ impl PlayerApp {
             albums: Vec::new(),
             tracks: Vec::new(),
             selected_artist: None,
-            selected_album: None,
+            album_covers: HashMap::new(),
+            cover_pending: HashSet::new(),
             queue: Vec::new(),
             queue_index: None,
             cover: None,
@@ -597,7 +603,7 @@ impl PlayerApp {
                     self.start_scan()
                 } else {
                     self.reload_library_view();
-                    Task::none()
+                    self.cover_task()
                 }
             }
             Err(e) => {
@@ -651,7 +657,6 @@ impl PlayerApp {
         self.albums.clear();
         self.tracks.clear();
         self.selected_artist = None;
-        self.selected_album = None;
         if let Some(first) = self.artists.first().map(|a| a.id) {
             self.load_artist(first);
         }
@@ -665,6 +670,10 @@ impl PlayerApp {
             self.mb_cancel.store(true, Ordering::Relaxed);
         }
         self.view = view;
+        if view == View::Music {
+            // inzwischen geladene MusicBrainz-Bilder berücksichtigen
+            self.album_covers.retain(|_, c| c.is_some());
+        }
         if view == View::MusicBrainz {
             self.reload_mb_albums();
         }
@@ -807,8 +816,17 @@ impl PlayerApp {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::SelectArtist(id) => self.load_artist(id),
-            Message::SelectAlbum(album) => self.select_album(album),
+            Message::SelectArtist(id) => {
+                self.load_artist(id);
+                return self.cover_task();
+            }
+            Message::AlbumCovers(covers) => {
+                for (id, bytes) in covers {
+                    self.cover_pending.remove(&id);
+                    self.album_covers
+                        .insert(id, bytes.map(image::Handle::from_bytes));
+                }
+            }
             Message::PlayTrack(i) => {
                 let list = self.visible_tracks();
                 let Some(clicked) = list.get(i) else {
@@ -851,7 +869,12 @@ impl PlayerApp {
             Message::Volume(v) => self.audio.set_volume(v),
 
             Message::PaneResized(e) => self.columns.resize(e.split, e.ratio),
-            Message::ShowView(view) => self.show_view(view),
+            Message::ShowView(view) => {
+                self.show_view(view);
+                if view == View::Music {
+                    return self.cover_task();
+                }
+            }
             Message::SelectCompAlbum(a) => self.select_comp_album(a),
             Message::SelectPlaylist(id) => self.select_playlist(Some(id)),
             Message::ThemeSelected(theme) => {
@@ -912,6 +935,68 @@ impl PlayerApp {
                 _ => {}
             },
             Message::ClosePlaylistDialog => self.playlist_dialog = None,
+            Message::Mixtape(id) => {
+                let Some(p) = self.playlists.iter().find(|p| p.id == id) else {
+                    return Task::none();
+                };
+                let default_name = format!("{}.zip", db::sanitize_folder_name(&p.name));
+                return Task::perform(
+                    async move {
+                        folder::pick_save_zip("Mixtape speichern unter …", &default_name).await
+                    },
+                    move |target| Message::MixtapeTarget(id, target),
+                );
+            }
+            Message::MixtapeTarget(_, None) => {}
+            Message::MixtapeTarget(id, Some(target)) => {
+                let Some(name) = self
+                    .playlists
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.name.clone())
+                else {
+                    return Task::none();
+                };
+                let files: Vec<PathBuf> = match self.library.playlist_tracks(id) {
+                    Ok(t) => t.into_iter().map(|t| t.path).collect(),
+                    Err(e) => {
+                        self.status = Some(format!("Mixtape fehlgeschlagen: {}", db_error(&e)));
+                        return Task::none();
+                    }
+                };
+                self.status = Some(format!("Mixtape „{name}“ wird erstellt …"));
+                // ZIP schreiben im Hintergrund (viele/große Dateien)
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            mixtape::create(&target, &name, &files)
+                                .map(|o| (o.written, o.skipped, o.target))
+                                .map_err(|e| format!("{e:#}"))
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
+                    },
+                    Message::MixtapeDone,
+                );
+            }
+            Message::MixtapeDone(res) => {
+                self.status = Some(match res {
+                    Ok((written, skipped, target)) => {
+                        let file = target
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        if skipped == 0 {
+                            format!("Mixtape gespeichert: {file} ({written} Titel)")
+                        } else {
+                            format!(
+                                "Mixtape gespeichert: {file} ({written} Titel, {skipped} nicht gefunden)"
+                            )
+                        }
+                    }
+                    Err(e) => format!("Mixtape fehlgeschlagen: {e}"),
+                });
+            }
             Message::AskRenamePlaylist(id) => {
                 if let Some(p) = self.playlists.iter().find(|p| p.id == id) {
                     self.playlist_dialog = Some(PlaylistDialog::Rename {
@@ -949,7 +1034,9 @@ impl PlayerApp {
                         }
                     }
                     Ok(false) => {}
-                    Err(e) => self.status = Some(format!("Verschieben fehlgeschlagen: {e:#}")),
+                    Err(e) => {
+                        self.status = Some(format!("Verschieben fehlgeschlagen: {}", db_error(&e)))
+                    }
                 }
             }
             Message::AskDeletePlaylist(id) => {
@@ -970,7 +1057,7 @@ impl PlayerApp {
                             self.load_playlists();
                         }
                         Ok(false) => *error = Some("Der Titel ist schon in dieser Playlist".into()),
-                        Err(e) => *error = Some(format!("{e:#}")),
+                        Err(e) => *error = Some(db_error(&e)),
                     }
                 }
             }
@@ -980,7 +1067,7 @@ impl PlayerApp {
                         Ok(id) => {
                             if let Some(path) = add {
                                 if let Err(e) = self.library.add_to_playlist(id, path) {
-                                    *error = Some(format!("{e:#}"));
+                                    *error = Some(db_error(&e));
                                     return Task::none();
                                 }
                             }
@@ -988,7 +1075,7 @@ impl PlayerApp {
                             self.pl_selected = Some(id);
                             self.load_playlists();
                         }
-                        Err(e) => *error = Some(e.to_string()),
+                        Err(e) => *error = Some(db_error(&e)),
                     }
                 }
                 Some(PlaylistDialog::Rename { id, name, error }) => {
@@ -997,13 +1084,14 @@ impl PlayerApp {
                             self.playlist_dialog = None;
                             self.load_playlists();
                         }
-                        Err(e) => *error = Some(e.to_string()),
+                        Err(e) => *error = Some(db_error(&e)),
                     }
                 }
                 Some(PlaylistDialog::Delete { id, .. }) => {
                     let id = *id;
                     if let Err(e) = self.library.delete_playlist(id) {
-                        self.status = Some(format!("Playlist löschen fehlgeschlagen: {e:#}"));
+                        self.status =
+                            Some(format!("Playlist löschen fehlgeschlagen: {}", db_error(&e)));
                     }
                     self.playlist_dialog = None;
                     if self.pl_selected == Some(id) {
@@ -1016,7 +1104,7 @@ impl PlayerApp {
             Message::RemoveFromPlaylist(path) => {
                 if let Some(id) = self.pl_selected {
                     if let Err(e) = self.library.remove_from_playlist(id, &path) {
-                        self.status = Some(format!("Entfernen fehlgeschlagen: {e:#}"));
+                        self.status = Some(format!("Entfernen fehlgeschlagen: {}", db_error(&e)));
                     }
                     self.select_playlist(Some(id));
                 }
@@ -1244,7 +1332,7 @@ impl PlayerApp {
                         self.reload_library_view();
                         self.refresh_mb_filter();
                     }
-                    return Task::none();
+                    return self.cover_task();
                 }
                 let counter = self.search_generation.clone();
                 let db_path = self.db_path.clone();
@@ -1272,18 +1360,23 @@ impl PlayerApp {
                     self.filter = Some(hits);
                     self.reload_library_view();
                     self.refresh_mb_filter();
+                    return self.cover_task();
                 }
             }
             Message::ScanFinished(Ok(count)) => {
                 self.search.clear();
                 self.filter = None;
                 self.refresh_mb_filter();
+                // Album-IDs ändern sich beim Scan -> Cover-Cache verwerfen
+                self.album_covers.clear();
+                self.cover_pending.clear();
                 self.reload_library_view();
                 self.notice = (count == 0).then(|| {
                     "Keine Musikdateien gefunden. Erwartet wird die Struktur \
                      Künstler/Album/Titel (mp3, aac, m4a, opus)."
                         .to_string()
                 });
+                return self.cover_task();
             }
             Message::ScanFinished(Err(e)) => {
                 self.phase = Phase::NeedsFolder;
@@ -1382,9 +1475,18 @@ impl PlayerApp {
 
     fn load_artist(&mut self, id: i64) {
         self.selected_artist = Some(id);
-        self.selected_album = None;
         self.albums = self.library.albums(id).unwrap_or_default();
         self.tracks = self.library.tracks_by_artist(id).unwrap_or_default();
+        // Titel dieses Künstlers auf Samplern (Ordner „Compilations“) hängen hinten an
+        if let Some(a) = self.artists.iter().find(|a| a.id == id) {
+            if a.folder != COMPILATIONS {
+                let extra = self
+                    .library
+                    .compilation_tracks_for(&a.name, &a.folder)
+                    .unwrap_or_default();
+                self.tracks.extend(extra);
+            }
+        }
         self.apply_filter();
     }
 
@@ -1395,21 +1497,55 @@ impl PlayerApp {
             self.tracks.retain(|t| f.tracks.contains(&t.id));
             self.comp_albums.retain(|a| f.albums.contains(&a.id));
             self.comp_tracks.retain(|t| f.tracks.contains(&t.id));
-            self.pl_tracks.retain(|t| f.tracks.contains(&t.id));
         }
     }
 
-    fn select_album(&mut self, album: Option<i64>) {
-        self.selected_album = album;
-        let Some(artist) = self.selected_artist else {
-            return;
-        };
-        self.tracks = match album {
-            Some(id) => self.library.tracks_by_album(id),
-            None => self.library.tracks_by_artist(artist),
+    /// Lädt (im Hintergrund) die Cover der Alben des gewählten Künstlers, die noch
+    /// nicht im Cache sind: eingebettetes Cover der ersten Datei, sonst das Bild
+    /// aus musicbrainz.db (nur Albumbild).
+    fn cover_task(&mut self) -> Task<Message> {
+        let mut wanted: Vec<(i64, PathBuf, String, String)> = Vec::new();
+        let mut seen = HashSet::new();
+        for t in &self.tracks {
+            if seen.insert(t.album_id)
+                && !self.album_covers.contains_key(&t.album_id)
+                && !self.cover_pending.contains(&t.album_id)
+            {
+                wanted.push((
+                    t.album_id,
+                    t.path.clone(),
+                    t.artist_name.clone(),
+                    t.album_title.clone(),
+                ));
+            }
         }
-        .unwrap_or_default();
-        self.apply_filter();
+        if wanted.is_empty() {
+            return Task::none();
+        }
+        self.cover_pending.extend(wanted.iter().map(|w| w.0));
+        let db_path = self.db_path.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    wanted
+                        .into_iter()
+                        .map(|(id, path, artist, album)| {
+                            // Album-Kopf: nur Albumbilder (kein Künstlerfoto als Cover)
+                            let bytes = db::read_cover(&path).or_else(|| {
+                                musicbrainz::read_images(&db_path, &artist, &album)
+                                    .ok()
+                                    .and_then(|i| i.album)
+                                    .filter(|b| !b.is_empty())
+                            });
+                            (id, bytes)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .unwrap_or_default()
+            },
+            Message::AlbumCovers,
+        )
     }
 
     // --- Wiedergabe --------------------------------------------------------
@@ -1507,9 +1643,10 @@ impl PlayerApp {
                 let browser = pane_grid(&self.columns, |_, kind, _| {
                     pane_grid::Content::new(match kind {
                         Column::Artists => self.artist_pane(),
-                        Column::Albums => self.album_pane(),
-                        Column::Tracks => self.track_pane(),
-                        Column::Playlists => unreachable!("nur in der Playlists-Ansicht"),
+                        Column::Albums => self.albums_pane(),
+                        Column::Tracks | Column::Playlists => {
+                            unreachable!("nur in Compilations/Playlists")
+                        }
                     })
                 })
                 .spacing(8)
@@ -1900,6 +2037,7 @@ impl PlayerApp {
                 key("Klick auf Titel", "Titel abspielen (die sichtbare Liste ist die Wiedergabeliste)"),
                 key("Suchfeld", "Sucht ab zwei Zeichen in Künstler, Album und Titel"),
                 key("Trennlinien ziehen", "Spaltenbreiten ändern"),
+                key("❣️ (Playlists)", "Mixtape: Playlist als ZIP speichern"),
                 key("✎ / ✕ (Playlists)", "Playlist umbenennen / löschen bzw. Titel entfernen"),
             ]
             .spacing(8),
@@ -1957,43 +2095,75 @@ impl PlayerApp {
         pane("KÜNSTLER", list.into())
     }
 
-    fn album_pane(&self) -> Element<'_, Message> {
-        let all = list_button(
-            text("Alle Alben").into(),
-            self.selected_album.is_none(),
-            Message::SelectAlbum(None),
-        );
-        let albums = self.albums.iter().map(|a| {
-            let label = match a.year {
-                Some(y) => format!("{y} · {}", a.title),
-                None => a.title.clone(),
-            };
-            list_button(
-                text(label).wrapping(Wrapping::None).into(),
-                self.selected_album == Some(a.id),
-                Message::SelectAlbum(Some(a.id)),
-            )
+    /// Music: alle Alben des Künstlers untereinander. Pro Album ein Kopf (Cover,
+    /// Titel, Jahr) und darunter die Titel; zwischen den Alben eine Trennlinie
+    /// mit 80 % Breite.
+    fn albums_pane(&self) -> Element<'_, Message> {
+        // Titel (mit globalem Index in `self.tracks`) nach Album gruppieren
+        let mut groups: Vec<(i64, Vec<(usize, &Track)>)> = Vec::new();
+        for (i, t) in self.tracks.iter().enumerate() {
+            match groups.last_mut() {
+                Some((id, items)) if *id == t.album_id => items.push((i, t)),
+                _ => groups.push((t.album_id, vec![(i, t)])),
+            }
+        }
+
+        let mut content = column![].spacing(14);
+        let last = groups.len().saturating_sub(1);
+        for (n, (album_id, items)) in groups.into_iter().enumerate() {
+            let album = self
+                .albums
+                .iter()
+                .chain(self.comp_albums.iter())
+                .find(|a| a.id == album_id);
+            let title = album
+                .map(|a| a.title.clone())
+                .unwrap_or_else(|| items[0].1.album_title.clone());
+            let mut titles = column![text(title).size(16)].spacing(2);
+            if let Some(year) = album.and_then(|a| a.year) {
+                titles = titles.push(text(year.to_string()).size(12).color(col().dim));
+            }
+            let header = row![
+                cover_box(self.album_covers.get(&album_id).and_then(|c| c.as_ref())),
+                titles
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center);
+
+            // Sampler-Alben enthalten hier nur Titel dieses Künstlers -> keine Künstler-Spalte
+            let is_comp = self.comp_albums.iter().any(|a| a.id == album_id);
+            let show_artist = !is_comp && items.iter().any(|(_, t)| t.compilation);
+            content = content.push(
+                column![header, self.track_rows(items, show_artist, false, false)].spacing(8),
+            );
+            if n < last {
+                content = content.push(row![
+                    iced::widget::Space::new().width(Length::FillPortion(1)),
+                    container(text(""))
+                        .width(Length::FillPortion(8))
+                        .height(1)
+                        .style(|_: &Theme| container::Style {
+                            background: Some(col().border.into()),
+                            ..container::Style::default()
+                        }),
+                    iced::widget::Space::new().width(Length::FillPortion(1)),
+                ]);
+            }
+        }
+
+        // Rechts Platz lassen, damit die Scrollbar nicht die Dauer überdeckt.
+        let content = container(content).padding(Padding {
+            right: 14.0,
+            ..Padding::ZERO
         });
-        let list = column(std::iter::once(all).chain(albums));
-        pane("ALBEN", list.into())
+        pane("ALBEN", content.into())
     }
 
-    fn track_pane(&self) -> Element<'_, Message> {
-        // Compilation: Künstler + Album; "Alle Alben": Album; sonst nur Titel
-        let compilation =
-            self.selected_album.is_some() && self.tracks.iter().any(|t| t.compilation);
-        self.track_list(
-            &self.tracks,
-            compilation,
-            compilation || self.selected_album.is_none(),
-            false,
-        )
-    }
-
-    /// Titelliste mit Nummer, Titel, optional Künstler/Album und Dauer.
-    fn track_list<'a>(
+    /// Zeilen mit Nummer, Titel, optional Künstler/Album und Dauer. Jeder Eintrag
+    /// trägt den Index in der abspielbaren Liste (`PlayTrack`).
+    fn track_rows<'a>(
         &'a self,
-        tracks: &'a [Track],
+        items: Vec<(usize, &'a Track)>,
         show_artist: bool,
         show_album: bool,
         removable: bool,
@@ -2003,7 +2173,7 @@ impl PlayerApp {
             o.as_deref().unwrap_or("—")
         }
 
-        let list = column(tracks.iter().enumerate().map(|(i, t)| {
+        column(items.into_iter().map(|(i, t)| {
             // Fehlender Pfad (Playlist): ⚠ statt Nummer
             let number = if t.missing {
                 text("⚠").color(col().warn)
@@ -2033,10 +2203,26 @@ impl PlayerApp {
             }
 
             list_button(r.into(), playing_id == Some(t.id), Message::PlayTrack(i))
-        }));
+        }))
+        .into()
+    }
 
+    /// Titelliste (Compilations, Playlists) als eigene Spalte.
+    fn track_list<'a>(
+        &'a self,
+        tracks: &'a [Track],
+        show_artist: bool,
+        show_album: bool,
+        removable: bool,
+    ) -> Element<'a, Message> {
+        let rows = self.track_rows(
+            tracks.iter().enumerate().collect(),
+            show_artist,
+            show_album,
+            removable,
+        );
         // Rechts Platz lassen, damit die Scrollbar nicht die Dauer überdeckt.
-        let list = container(list).padding(Padding {
+        let list = container(rows).padding(Padding {
             right: 14.0,
             ..Padding::ZERO
         });
@@ -2146,6 +2332,7 @@ impl PlayerApp {
                                     text(p.name.as_str())
                                         .wrapping(Wrapping::None)
                                         .width(Length::Fill),
+                                    small_glyph_button("❣️", Message::Mixtape(p.id)),
                                     small_glyph_button("✎", Message::AskRenamePlaylist(p.id)),
                                     small_x_button(Message::AskDeletePlaylist(p.id)),
                                 ]
@@ -2254,11 +2441,13 @@ impl PlayerApp {
                 Message::TogglePause,
             ),
             icon_button(ICON_NEXT, Message::Next),
-            column![
+            // Texte abschneiden statt in den Lautstärke-Slider hineinzulaufen
+            container(column![
                 text(title).wrapping(Wrapping::None),
-                text(subtitle).size(12)
-            ]
-            .width(Length::Fill),
+                text(subtitle).size(12).wrapping(Wrapping::None)
+            ])
+            .width(Length::Fill)
+            .clip(true),
             icon(ICON_VOLUME, 20.0, col().dim),
             slider(0.0..=1.0, self.audio.volume(), Message::Volume)
                 .step(0.01 as f32)
@@ -2278,26 +2467,7 @@ impl PlayerApp {
         .spacing(10)
         .align_y(Alignment::Center);
 
-        let cover_content: Element<'_, Message> = match &self.cover {
-            Some(handle) => image(handle)
-                .width(72)
-                .height(72)
-                .content_fit(iced::ContentFit::Cover)
-                .into(),
-            None => icon(ICON_IMAGE, 28.0, col().dim).into(),
-        };
-        let cover = container(cover_content)
-            .center(Length::Fixed(72.0))
-            .clip(true)
-            .style(|_: &Theme| container::Style {
-                background: Some(col().selected.into()),
-                border: Border {
-                    color: col().dim,
-                    width: 1.0,
-                    radius: 4.0.into(),
-                },
-                ..container::Style::default()
-            });
+        let cover = cover_box(self.cover.as_ref());
 
         container(
             row![
@@ -2428,6 +2598,52 @@ fn err_text(e: &Option<String>) -> Element<'_, Message> {
     }
 }
 
+/// Cover-Kachel (72 px, wie im Player); ohne Bild ein Platzhalter-Icon.
+fn cover_box<'a>(handle: Option<&image::Handle>) -> Element<'a, Message> {
+    let content: Element<'a, Message> = match handle {
+        Some(handle) => image(handle.clone())
+            .width(72)
+            .height(72)
+            .content_fit(iced::ContentFit::Cover)
+            .into(),
+        None => icon(ICON_IMAGE, 28.0, col().dim).into(),
+    };
+    container(content)
+        .center(Length::Fixed(72.0))
+        .clip(true)
+        .style(|_: &Theme| container::Style {
+            background: Some(col().selected.into()),
+            border: Border {
+                color: col().dim,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// Fehlertext für Datenbankfehler; „gesperrt“ bekommt eine verständliche Meldung.
+fn db_error(e: &anyhow::Error) -> String {
+    let busy = e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(f, _))
+                if matches!(
+                    f.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    });
+    if busy {
+        "Die Datenbank ist gerade belegt (MusicBrainz-Abgleich oder Einlesen läuft). \
+         Bitte kurz warten und erneut versuchen."
+            .to_string()
+    } else {
+        format!("{e:#}")
+    }
+}
+
 /// Abgedunkelter Hintergrund mit zentriertem Dialog; Klick daneben schließt.
 fn modal<'a>(dialog: Element<'a, Message>, on_close: Message) -> Element<'a, Message> {
     opaque(
@@ -2467,6 +2683,24 @@ fn small_x_button(on_press: Message) -> Element<'static, Message> {
 /// Einzeiliger, abgeschnittener Text.
 fn cell(s: &str) -> container::Container<'_, Message> {
     container(text(s).wrapping(Wrapping::None)).clip(true)
+}
+
+#[cfg(test)]
+mod db_error_tests {
+    use super::*;
+
+    #[test]
+    fn gesperrte_db_bekommt_verstaendliche_meldung() {
+        let busy = anyhow::Error::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(5), // SQLITE_BUSY
+            Some("database is locked".into()),
+        ));
+        assert!(db_error(&busy).contains("gerade belegt"));
+        assert_eq!(
+            db_error(&anyhow::anyhow!("Bitte einen Namen eingeben")),
+            "Bitte einen Namen eingeben"
+        );
+    }
 }
 
 #[cfg(test)]
