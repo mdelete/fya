@@ -15,23 +15,18 @@ wenn sie leer ist oder der Ordner verschoben wurde. Über **Ordner ändern …**
 
 Datenbank:
 - Linux: `~/.local/share/fya/library.db`
-- macOS (Sandbox): `~/Library/Containers/<Bundle-ID>/Data/Library/Application Support/fya/library.db`
+- macOS: `~/Library/Application Support/fya/library.db`
 
-## macOS: App Sandbox
-Die App läuft als sandboxed .app (`macos/entitlements.plist`):
+## macOS
+Die App läuft **ohne** App Sandbox (keine Entitlements): Sie liest und schreibt den
+gewählten Musikordner direkt (Tags werden geschrieben). Der Ordner-Dialog (NSOpenPanel,
+`src/folder.rs`) zeigt auch versteckte Ordner. Nach dem Auswählen wird weiterhin ein
+Bookmark in der Datenbank abgelegt; ohne Sandbox genügt aber der Pfad.
 
-| Entitlement | Zweck |
-|---|---|
-| `com.apple.security.app-sandbox` | Sandbox an |
-| `com.apple.security.files.user-selected.read-only` | gewählten Ordner lesen |
-| `com.apple.security.files.bookmarks.app-scope` | Zugriff über Neustarts (Bookmark) |
-
-Ablauf: Ordner-Dialog (NSOpenPanel via `rfd`) → Zugriff gilt für diese Sitzung →
-direkt danach wird ein Security-Scoped Bookmark erzeugt und mit dem Pfad in der DB
-gespeichert → beim Start wird es aufgelöst und `startAccessingSecurityScopedResource`
-aufgerufen (`src/folder.rs`). Es braucht keine Dateizugriffs-Texte (TCC) mehr, und
-auf Desktop/Dokumente/Downloads wird nichts mehr abgefragt, außer der User wählt dort
-den Ordner aus.
+Hinweis: Frühere Sandbox-Builds haben ihre Daten unter
+`~/Library/Containers/<Bundle-ID>/Data/Library/Application Support/fya/` abgelegt; diese
+Dateien werden nicht übernommen (Einstellungen/Playlists dort ggf. nach
+`~/Library/Application Support/fya/` kopieren).
 
 Bauen und starten:
 ```
@@ -41,9 +36,8 @@ open "target/FYA.app"
 - Bundle-ID `de.silpion.fya` in `macos/Info.plist` anpassen.
 - `SIGN_IDENTITY="Apple Development: …"` setzen, um mit eigenem Zertifikat zu signieren
   (Standard: ad-hoc, reicht lokal).
-- Mit `cargo run` läuft die Binary **ohne** Sandbox (und damit mit normalem Pfadzugriff,
-  der Dialog fragt trotzdem). Getestet wird die Sandbox nur über das .app-Bundle.
-- Neu anfangen: App beenden und die DB im Container löschen.
+- `cargo run` und das .app-Bundle verwenden dieselbe Datenbank.
+- Neu anfangen: App beenden und `~/Library/Application Support/fya/` löschen.
 
 ## Systemabhängigkeiten
 Aktuelles stable Rust (Edition 2024).

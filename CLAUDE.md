@@ -20,5 +20,5 @@ Code-Kommentare und UI-Texte sind überwiegend deutsch.
 ## Sonstiges
 
 - Bauen/Testen: `cargo build`, `cargo test`. macOS-App-Bundle: `scripts/bundle-macos.sh`.
-- Die macOS-Sandbox braucht Lese-/Schreibrechte auf den Musikordner (Tags werden geschrieben),
-  siehe `macos/entitlements.plist`.
+- Die macOS-App läuft **ohne** App Sandbox (keine Entitlements), damit sie frei auf den
+  Musikordner zugreifen und externe Programme starten kann.

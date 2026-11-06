@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Baut "FYA.app" und signiert sie mit App-Sandbox-Entitlements.
+# Baut "FYA.app" (ohne App Sandbox) und signiert sie.
 #
 #   ./scripts/bundle-macos.sh                       # ad-hoc Signatur
 #   SIGN_IDENTITY="Apple Development: Name (TEAMID)" ./scripts/bundle-macos.sh
 #
-# Die App läuft in der App Sandbox (macos/entitlements.plist). Den Musikordner
-# wählt der User im Ordner-Dialog; der Zugriff bleibt über ein Security-Scoped
-# Bookmark in der Datenbank erhalten. Für lokale Tests genügt die ad-hoc
-# Signatur; für Verteilung/Notarisierung ein Developer-ID-Zertifikat verwenden.
+# Die App läuft bewusst ohne App Sandbox: Sie darf frei auf den Musikordner zugreifen
+# und externe Programme starten. Für lokale Tests genügt die ad-hoc Signatur; für
+# Verteilung/Notarisierung ein Developer-ID-Zertifikat verwenden.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -31,13 +30,9 @@ for s in 16 32 128 256 512; do
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 
-codesign --force --deep --sign "$IDENTITY" --identifier "$BUNDLE_ID" \
-    --entitlements macos/entitlements.plist "$APP"
+codesign --force --deep --sign "$IDENTITY" --identifier "$BUNDLE_ID" "$APP"
 codesign --verify --verbose "$APP"
 
-echo "Entitlements:"
-codesign -d --entitlements - "$APP" 2>/dev/null | grep -A1 "com.apple" || true
-
 echo "Fertig: $APP"
-echo "Datenbank (im Container):"
-echo "  ~/Library/Containers/$BUNDLE_ID/Data/Library/Application Support/fya/library.db"
+echo "Datenbank:"
+echo "  ~/Library/Application Support/fya/library.db"
