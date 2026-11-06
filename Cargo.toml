@@ -10,8 +10,8 @@ tokio = { version = "1", features = ["rt", "sync"] }
 # Nativer Ordner-Dialog: macOS = NSOpenPanel, Linux = XDG Desktop Portal
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
-lofty = "0.22"
-rodio = { version = "0.21", default-features = false, features = [
+lofty = "0.25"
+rodio = { version = "0.23", default-features = false, features = [
     "playback",
     "symphonia-mp3",
     "symphonia-aac",

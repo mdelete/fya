@@ -70,6 +70,8 @@ fn main() -> anyhow::Result<()> {
 
     // Legt Datei + Schema an; der Scan folgt erst nach der Ordnerwahl.
     let library = Library::open(&db_path)?;
+    // Beim Start läuft die Ausgabe auf dem Systemstandard; danach wird nur noch auf
+    // ausdrücklich gewählte Geräte gewechselt.
     let audio = Audio::new()?;
 
     // iced ruft die Boot-Funktion genau einmal auf; so reichen wir die
@@ -299,6 +301,11 @@ enum Message {
     SelectCompAlbum(Option<i64>),
     SelectPlaylist(i64),
     ThemeSelected(Theme),
+    /// Lautsprecher-Knopf im Player: Geräte-Popover öffnen/schließen
+    ToggleDeviceMenu,
+    DevicesLoaded(Vec<String>),
+    /// Ausgabegerät ausdrücklich wählen
+    SelectDevice(String),
     /// Einstellung: Mixtapes immer konvertieren (an/aus) bzw. Zielformat
     MixtapeConvert(bool),
     MixtapeFormat(mixtape::Format),
@@ -433,6 +440,9 @@ struct PlayerApp {
     library: Library,
     db_path: PathBuf,
     audio: Audio,
+    /// Ausgabegerät-Menü (Popover im Player): Menü offen?, Geräteliste
+    device_menu_open: bool,
+    devices: Vec<String>,
 
     /// Zugriff auf den gewählten Ordner (unter der Sandbox zwingend nötig)
     access: Option<FolderAccess>,
@@ -511,6 +521,8 @@ impl PlayerApp {
             library,
             db_path,
             audio,
+            device_menu_open: false,
+            devices: Vec::new(),
             access: None,
             phase: Phase::NeedsFolder,
             notice: None,
@@ -739,6 +751,20 @@ impl PlayerApp {
         }
     }
 
+    /// Ausgabegerät ist verschwunden: Wiedergabe pausieren und auf den Systemstandard
+    /// umstellen (nur in diesem Fall; sonst wird nie automatisch gewechselt).
+    fn handle_device_lost(&mut self) {
+        let was_playing = self.audio.is_active();
+        self.status = Some(match self.audio.recover_from_lost_device() {
+            Ok(()) if was_playing => {
+                "Ausgabegerät nicht mehr verfügbar – Wiedergabe pausiert, Systemstandard aktiv"
+                    .to_string()
+            }
+            Ok(()) => "Ausgabegerät nicht mehr verfügbar – Systemstandard aktiv".to_string(),
+            Err(e) => format!("Ausgabegerät nicht mehr verfügbar: {e:#}"),
+        });
+    }
+
     fn stop_playback(&mut self) {
         self.audio.stop();
         self.queue.clear();
@@ -872,6 +898,11 @@ impl PlayerApp {
             Message::Next => self.next(),
             Message::Previous => self.previous(),
             Message::Tick => {
+                // Gerät verschwunden (Callback-Flag, kein Treiberzugriff): pausieren +
+                // Systemstandard
+                if self.audio.take_device_lost() {
+                    self.handle_device_lost();
+                }
                 if self.audio.take_finished() {
                     self.next();
                 }
@@ -912,17 +943,56 @@ impl PlayerApp {
                     .library
                     .set_setting("mixtape_convert", if on { "1" } else { "0" })
                 {
-                    self.status = Some(format!("Einstellung konnte nicht gespeichert werden: {e:#}"));
+                    self.status = Some(format!(
+                        "Einstellung konnte nicht gespeichert werden: {e:#}"
+                    ));
                 }
             }
             Message::MixtapeFormat(f) => {
                 self.mixtape_format = f;
                 if let Err(e) = self.library.set_setting("mixtape_format", f.key()) {
-                    self.status = Some(format!("Einstellung konnte nicht gespeichert werden: {e:#}"));
+                    self.status = Some(format!(
+                        "Einstellung konnte nicht gespeichert werden: {e:#}"
+                    ));
+                }
+            }
+            Message::ToggleDeviceMenu => {
+                self.device_menu_open = !self.device_menu_open;
+                if self.device_menu_open {
+                    // Geräteliste im Hintergrund holen (Treiberabfrage kann dauern)
+                    return Task::perform(
+                        async {
+                            tokio::task::spawn_blocking(audio::output_devices)
+                                .await
+                                .unwrap_or_default()
+                        },
+                        Message::DevicesLoaded,
+                    );
+                }
+            }
+            Message::DevicesLoaded(devices) => {
+                // Das aktuelle Gerät fehlt in der Liste (z. B. getrennt, bevor der Callback
+                // gemeldet hat) -> wie „Gerät verschwunden“ behandeln.
+                let gone = !devices.is_empty()
+                    && self
+                        .audio
+                        .device()
+                        .is_some_and(|d| !devices.iter().any(|n| n == d));
+                self.devices = devices;
+                if gone {
+                    self.handle_device_lost();
+                }
+            }
+            Message::SelectDevice(name) => {
+                self.device_menu_open = false;
+                if let Err(e) = self.audio.set_device(Some(&name)) {
+                    self.status = Some(format!("Ausgabegerät: {e:#}"));
                 }
             }
             Message::Escape => {
-                if self.tag_editor.as_ref().is_some_and(|ed| !ed.saving) {
+                if self.device_menu_open {
+                    self.device_menu_open = false;
+                } else if self.tag_editor.as_ref().is_some_and(|ed| !ed.saving) {
                     self.tag_editor = None;
                 } else {
                     self.playlist_dialog = None;
@@ -1615,6 +1685,14 @@ impl PlayerApp {
         let Some(track) = self.queue.get(index) else {
             return;
         };
+        // War das Gerät inzwischen weg: erst auf den Systemstandard umstellen, dann spielen
+        let lost = self.audio.take_device_lost();
+        if lost {
+            if let Err(e) = self.audio.recover_from_lost_device() {
+                self.status = Some(format!("Ausgabegerät nicht mehr verfügbar: {e:#}"));
+                return;
+            }
+        }
         match self.audio.play(&track.path) {
             Ok(()) => {
                 self.queue_index = Some(index);
@@ -1629,7 +1707,9 @@ impl PlayerApp {
                     })
                     .map(image::Handle::from_bytes);
                 self.seek_preview = None;
-                self.status = None;
+                self.status = lost.then(|| {
+                    "Ausgabegerät nicht mehr verfügbar – Systemstandard aktiv".to_string()
+                });
             }
             Err(e) if folder::is_permission_denied(&e) => {
                 self.status = Some(
@@ -1734,13 +1814,19 @@ impl PlayerApp {
                     bottom: 8.0,
                     left: 8.0,
                 });
-                if self.tag_editor.is_some() {
-                    stack![main, self.tag_editor_dialog()].into()
+                // Immer derselbe Aufbau `stack![main, overlay]`: Würde die Ansicht beim Öffnen
+                // eines Dialogs/Popovers von `main` auf `stack![main, …]` wechseln, verwirft
+                // iced den Zustand des Baums (u. a. die Scrollpositionen aller Listen).
+                let overlay: Element<'_, Message> = if self.tag_editor.is_some() {
+                    self.tag_editor_dialog()
                 } else if self.playlist_dialog.is_some() {
-                    stack![main, self.playlist_dialog_view()].into()
+                    self.playlist_dialog_view()
+                } else if self.device_menu_open {
+                    self.device_menu()
                 } else {
-                    main.into()
-                }
+                    iced::widget::Space::new().into()
+                };
+                stack![main, overlay].into()
             }
         }
     }
@@ -2098,6 +2184,7 @@ impl PlayerApp {
                 key("Klick auf Titel", "Titel abspielen (die sichtbare Liste ist die Wiedergabeliste)"),
                 key("Suchfeld", "Sucht ab zwei Zeichen in Künstler, Album und Titel"),
                 key("Trennlinien ziehen", "Spaltenbreiten ändern"),
+                key("Lautsprecher-Knopf (Player)", "Ausgabegerät wählen (z. B. Bluetooth-Lautsprecher). Es wird nie automatisch gewechselt; verschwindet das Gerät, pausiert die Wiedergabe und der Systemstandard wird aktiv"),
                 key("❣️ (Playlists)", "Mixtape: Playlist als ZIP speichern (optional per ffmpeg konvertiert, siehe Einstellungen)"),
                 key("✎ / ✕ (Playlists)", "Playlist umbenennen / löschen bzw. Titel entfernen"),
             ]
@@ -2121,8 +2208,8 @@ impl PlayerApp {
     /// „Mixtapes immer konvertieren in: [Format]“ – nur aktiv, wenn ffmpeg gefunden wurde.
     fn mixtape_setting(&self) -> Element<'_, Message> {
         let available = self.ffmpeg.is_some();
-        let mut checkbox = checkbox(self.mixtape_convert && available)
-            .label("Mixtapes immer konvertieren in:");
+        let mut checkbox =
+            checkbox(self.mixtape_convert && available).label("Mixtapes immer konvertieren in:");
         let mut formats = row![].spacing(10).align_y(Alignment::Center);
         if available {
             checkbox = checkbox.on_toggle(Message::MixtapeConvert);
@@ -2315,6 +2402,61 @@ impl PlayerApp {
             ..Padding::ZERO
         });
         pane("TITEL", list.into())
+    }
+
+    /// Popover über dem Lautsprecher-Knopf: Systemstandard + alle Ausgabegeräte.
+    /// (iced hat kein fertiges Popover: Vollflächen-`mouse_area` zum Schließen + Menü.)
+    fn device_menu(&self) -> Element<'_, Message> {
+        let check = |on: bool| container(text(if on { "✓" } else { "" })).width(20);
+
+        let mut items = column![];
+        for name in &self.devices {
+            items = items.push(list_button(
+                row![
+                    check(self.audio.device() == Some(name.as_str())),
+                    text(name.as_str()).wrapping(Wrapping::None),
+                ]
+                .align_y(Alignment::Center)
+                .into(),
+                false,
+                Message::SelectDevice(name.clone()),
+            ));
+        }
+        if self.devices.is_empty() {
+            items = items.push(
+                text("Keine Ausgabegeräte gefunden")
+                    .size(13)
+                    .color(col().dim),
+            );
+        }
+
+        let menu = container(
+            column![
+                text("AUSGABEGERÄT").size(12).color(col().dim),
+                scrollable(items).height(Length::Shrink),
+            ]
+            .spacing(6),
+        )
+        .padding(10)
+        .width(Length::Fixed(320.0))
+        .max_height(360)
+        .style(panel_style);
+
+        // Klick daneben schließt; das Menü selbst ist `opaque`.
+        let dismiss = mouse_area(container(text("")).width(Length::Fill).height(Length::Fill))
+            .on_press(Message::ToggleDeviceMenu);
+        let popover = container(opaque(menu))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::End)
+            .align_y(Alignment::End)
+            // etwa über dem Lautsprecher-Knopf (rechts in der Player-Leiste)
+            .padding(Padding {
+                right: 170.0,
+                bottom: 106.0,
+                ..Padding::ZERO
+            });
+        stack![dismiss, popover].into()
     }
 
     /// Modale Playlist-Dialoge (Neu / Hinzufügen / Löschen).
@@ -2536,6 +2678,7 @@ impl PlayerApp {
             ])
             .width(Length::Fill)
             .clip(true),
+            icon_button(ICON_SPEAKER, Message::ToggleDeviceMenu),
             icon(ICON_VOLUME, 20.0, col().dim),
             slider(0.0..=1.0, self.audio.volume(), Message::Volume)
                 .step(0.01 as f32)
@@ -2602,6 +2745,7 @@ const ICON_HEXAGON: &[u8] = include_bytes!("../assets/icons/hexagon.svg");
 const ICON_COMPILATIONS: &[u8] = include_bytes!("../assets/icons/list-music.svg");
 const ICON_PLAYLISTS: &[u8] = include_bytes!("../assets/icons/list-ordered.svg");
 const ICON_HELP: &[u8] = include_bytes!("../assets/icons/circle-help.svg");
+const ICON_SPEAKER: &[u8] = include_bytes!("../assets/icons/speaker.svg");
 const ICON_SETTINGS: &[u8] = include_bytes!("../assets/icons/settings.svg");
 
 /// Einfarbiges SVG-Icon (Lucide-Icons nutzen `currentColor`, daher Farbfilter).

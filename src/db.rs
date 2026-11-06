@@ -256,7 +256,9 @@ impl Library {
     /// Einfache Einstellung (Textwert) aus der Tabelle `settings`.
     pub fn setting(&self, key: &str) -> Option<String> {
         self.conn
-            .query_row("SELECT text FROM settings WHERE key = ?1", [key], |r| r.get(0))
+            .query_row("SELECT text FROM settings WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
             .optional()
             .ok()
             .flatten()
@@ -413,8 +415,12 @@ impl Library {
                     duration_secs: r.get(4)?,
                     album_title: r.get(5)?,
                     artist_name: r.get(6)?,
-                    artist_tag: r.get::<_, Option<String>>(7)?.filter(|s| !s.trim().is_empty()),
-                    album_tag: r.get::<_, Option<String>>(8)?.filter(|s| !s.trim().is_empty()),
+                    artist_tag: r
+                        .get::<_, Option<String>>(7)?
+                        .filter(|s| !s.trim().is_empty()),
+                    album_tag: r
+                        .get::<_, Option<String>>(8)?
+                        .filter(|s| !s.trim().is_empty()),
                     compilation: r.get(9)?,
                     album_id: r.get::<_, Option<i64>>(10)?.unwrap_or(0),
                     path,
@@ -472,8 +478,10 @@ impl Library {
         if exists {
             bail!("Eine Playlist „{name}“ gibt es schon");
         }
-        self.conn
-            .execute("UPDATE playlists SET name = ?1 WHERE id = ?2", params![name, id])?;
+        self.conn.execute(
+            "UPDATE playlists SET name = ?1 WHERE id = ?2",
+            params![name, id],
+        )?;
         Ok(())
     }
 
@@ -498,7 +506,8 @@ impl Library {
         let (pos_a, pos_b) = (rows[i].0, rows[j as usize].0);
         // Positionen tauschen (Primärschlüssel -> über eine freie Zwischenposition)
         let tx = self.conn.unchecked_transaction()?;
-        let upd = "UPDATE playlist_tracks SET position = ?1 WHERE playlist_id = ?2 AND position = ?3";
+        let upd =
+            "UPDATE playlist_tracks SET position = ?1 WHERE playlist_id = ?2 AND position = ?3";
         tx.execute(upd, params![-1, id, pos_a])?;
         tx.execute(upd, params![pos_a, id, pos_b])?;
         tx.execute(upd, params![pos_b, id, -1])?;
@@ -509,7 +518,8 @@ impl Library {
     pub fn delete_playlist(&self, id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM playlist_tracks WHERE playlist_id = ?1", [id])?;
-        self.conn.execute("DELETE FROM playlists WHERE id = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM playlists WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -686,12 +696,12 @@ fn read_meta(path: &Path) -> Meta {
             .filter(|s| !s.trim().is_empty());
         meta.artist = tag.artist().map(|s| s.into_owned());
         meta.album = tag.album().map(|s| s.into_owned());
-        meta.album_artist = text_item(tag, &ItemKey::AlbumArtist);
-        meta.composer = text_item(tag, &ItemKey::Composer);
+        meta.album_artist = text_item(tag, ItemKey::AlbumArtist);
+        meta.composer = text_item(tag, ItemKey::Composer);
         meta.track_no = tag.track();
         meta.track_total = tag.track_total();
         meta.compilation =
-            tag.get(&ItemKey::FlagCompilation)
+            tag.get(ItemKey::FlagCompilation)
                 .is_some_and(|item| match item.value() {
                     ItemValue::Text(t) | ItemValue::Locator(t) => {
                         matches!(t.trim().to_lowercase().as_str(), "1" | "true" | "yes")
@@ -699,7 +709,7 @@ fn read_meta(path: &Path) -> Meta {
                     ItemValue::Binary(b) => b.first().is_some_and(|&x| x == 1 || x == b'1'),
                 });
         meta.disc_no = tag.disk();
-        meta.year = tag.year();
+        meta.year = tag.date().map(|d| u32::from(d.year));
     }
     meta
 }
@@ -769,7 +779,7 @@ pub fn read_cover(path: &Path) -> Option<Vec<u8>> {
         .map(|p| p.data().to_vec())
 }
 
-fn text_item(tag: &lofty::tag::Tag, key: &ItemKey) -> Option<String> {
+fn text_item(tag: &lofty::tag::Tag, key: ItemKey) -> Option<String> {
     tag.get_string(key)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -1078,20 +1088,21 @@ pub fn read_tag_edit(path: &Path) -> Result<TagEdit> {
     let tagged = lofty::read_from_path(path)?;
     let mut e = TagEdit::default();
     if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
-        let s = |v: Option<std::borrow::Cow<'_, str>>| v.map(|c| c.into_owned()).unwrap_or_default();
+        let s =
+            |v: Option<std::borrow::Cow<'_, str>>| v.map(|c| c.into_owned()).unwrap_or_default();
         let n = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_default();
         e.title = s(tag.title());
         e.artist = s(tag.artist());
         e.album = s(tag.album());
         e.genre = s(tag.genre());
-        e.album_artist = text_item(tag, &ItemKey::AlbumArtist).unwrap_or_default();
-        e.composer = text_item(tag, &ItemKey::Composer).unwrap_or_default();
+        e.album_artist = text_item(tag, ItemKey::AlbumArtist).unwrap_or_default();
+        e.composer = text_item(tag, ItemKey::Composer).unwrap_or_default();
         e.track_no = n(tag.track());
         e.track_total = n(tag.track_total());
         e.disc_no = n(tag.disk());
-        e.year = n(tag.year());
+        e.year = n(tag.date().map(|d| u32::from(d.year)));
         e.compilation = tag
-            .get(&ItemKey::FlagCompilation)
+            .get(ItemKey::FlagCompilation)
             .is_some_and(|item| match item.value() {
                 ItemValue::Text(t) | ItemValue::Locator(t) => {
                     matches!(t.trim().to_lowercase().as_str(), "1" | "true" | "yes")
@@ -1108,7 +1119,11 @@ impl TagEdit {
         parse_num("Track", &self.track_no)?;
         parse_num("Track gesamt", &self.track_total)?;
         parse_num("Disc", &self.disc_no)?;
-        parse_num("Jahr", &self.year)?;
+        if let Some(y) = parse_num("Jahr", &self.year)? {
+            if !(1..=9999).contains(&y) {
+                bail!("Jahr: „{y}“ ist ungültig (1–9999)");
+            }
+        }
         Ok(())
     }
 }
@@ -1151,7 +1166,7 @@ pub fn write_tag_edit(path: &Path, e: &TagEdit) -> Result<()> {
             Some(v) => {
                 tag.insert_text(key, v);
             }
-            None => tag.remove_key(&key),
+            None => tag.remove_key(key),
         }
     }
     match parse_num("Track", &e.track_no)? {
@@ -1167,13 +1182,22 @@ pub fn write_tag_edit(path: &Path, e: &TagEdit) -> Result<()> {
         None => tag.remove_disk(),
     }
     match parse_num("Jahr", &e.year)? {
-        Some(v) => tag.set_year(v),
-        None => tag.remove_year(),
+        Some(v) => {
+            // Nur das Jahr ersetzen; Monat/Tag eines vorhandenen Datums bleiben erhalten
+            let year = u16::try_from(v).ok().filter(|y| (1..=9999).contains(y));
+            let Some(year) = year else {
+                bail!("Jahr: „{v}“ ist ungültig (1–9999)");
+            };
+            let mut date = tag.date().unwrap_or_default();
+            date.year = year;
+            tag.set_date(date);
+        }
+        None => tag.remove_date(),
     }
     if e.compilation {
         tag.insert_text(ItemKey::FlagCompilation, "1".to_string());
     } else {
-        tag.remove_key(&ItemKey::FlagCompilation);
+        tag.remove_key(ItemKey::FlagCompilation);
     }
 
     tag.save_to_path(path, WriteOptions::default())?;
@@ -1217,7 +1241,10 @@ mod playlist_tests {
         let lib = Library::open(&dir.join("library.db")).unwrap();
 
         let id = lib.create_playlist("  Mix  ").unwrap();
-        assert!(lib.create_playlist("mix").is_err(), "Name eindeutig (NOCASE)");
+        assert!(
+            lib.create_playlist("mix").is_err(),
+            "Name eindeutig (NOCASE)"
+        );
         assert!(lib.create_playlist("   ").is_err());
 
         let p = Path::new("/nicht/vorhanden/a.mp3");
@@ -1238,7 +1265,12 @@ mod playlist_tests {
         lib.add_to_playlist(id, b).unwrap();
         assert!(!lib.move_in_playlist(id, a, -1).unwrap(), "am Anfang");
         assert!(lib.move_in_playlist(id, a, 1).unwrap());
-        let titles: Vec<_> = lib.playlist_tracks(id).unwrap().into_iter().map(|t| t.title).collect();
+        let titles: Vec<_> = lib
+            .playlist_tracks(id)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
         assert_eq!(titles, ["b", "a"]);
         let other = lib.create_playlist("Andere").unwrap();
         assert!(lib.rename_playlist(id, "andere").is_err(), "Name vergeben");
@@ -1260,7 +1292,10 @@ mod display_title_tests {
     fn tag_ersetzt_nur_bei_sanitisierten_sonderzeichen() {
         let t = |f: &str, tag: Option<&str>| display_title(f.into(), tag.map(Into::into));
         assert_eq!(
-            t("Secret History_ Best of the Divine Comedy", Some("Secret History: Best of the Divine Comedy")),
+            t(
+                "Secret History_ Best of the Divine Comedy",
+                Some("Secret History: Best of the Divine Comedy")
+            ),
             "Secret History: Best of the Divine Comedy"
         );
         assert_eq!(t("Who_s Next_", Some("Who's Next?")), "Who_s Next_"); // ' wird nicht ersetzt -> kein Treffer
@@ -1316,7 +1351,9 @@ mod compilation_tests {
     #[test]
     fn sampler_titel_des_kuenstlers() {
         let (lib, dir) = fixture("tracks");
-        let t = lib.compilation_tracks_for("The Prodigy", "The Prodigy").unwrap();
+        let t = lib
+            .compilation_tracks_for("The Prodigy", "The Prodigy")
+            .unwrap();
         let titles: Vec<_> = t.iter().map(|t| t.title.as_str()).collect();
         assert_eq!(titles, ["Breathe", "Voodoo People"]); // nur Titel dieses Künstlers
         let _ = std::fs::remove_dir_all(dir);
@@ -1364,7 +1401,11 @@ mod busy_tests {
         other.execute_batch("BEGIN IMMEDIATE").unwrap();
         let start = Instant::now();
         let err = lib.add_to_playlist(pl, Path::new("/x.mp3")).unwrap_err();
-        assert!(start.elapsed().as_secs_f32() < 2.0, "blockiert zu lange: {:?}", start.elapsed());
+        assert!(
+            start.elapsed().as_secs_f32() < 2.0,
+            "blockiert zu lange: {:?}",
+            start.elapsed()
+        );
         assert!(err.chain().any(|c| matches!(
             c.downcast_ref::<rusqlite::Error>(),
             Some(rusqlite::Error::SqliteFailure(f, _)) if f.code == rusqlite::ErrorCode::DatabaseBusy
@@ -1372,6 +1413,102 @@ mod busy_tests {
         other.execute_batch("COMMIT").unwrap();
         // danach geht es wieder
         assert!(lib.add_to_playlist(pl, Path::new("/x.mp3")).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod year_tests {
+    use super::*;
+
+    /// Jahr lesen/schreiben/entfernen mit lofty 0.25 (`date()` statt `year()`), für
+    /// MP3, Opus und M4A; ein vorhandenes Datum behält Monat und Tag. Braucht ffmpeg
+    /// (sonst übersprungen).
+    #[test]
+    fn jahr_lesen_schreiben_entfernen() {
+        let Some(ffmpeg) = crate::mixtape::find_ffmpeg() else {
+            eprintln!("ffmpeg nicht installiert – übersprungen");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("fya-year-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for (ext, codec) in [("mp3", "libmp3lame"), ("opus", "libopus"), ("m4a", "aac")] {
+            let file = dir.join(format!("t.{ext}"));
+            let ok = std::process::Command::new(&ffmpeg)
+                .args([
+                    "-nostdin",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=48000:cl=stereo",
+                    "-t",
+                    "1",
+                ])
+                .args([
+                    "-metadata",
+                    "date=2001-05-06",
+                    "-metadata",
+                    "title=T",
+                    "-c:a",
+                    codec,
+                ])
+                .arg(&file)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{ext}: ffmpeg");
+
+            // lesen
+            assert_eq!(read_meta(&file).year, Some(2001), "{ext}: Jahr lesen");
+            let mut e = read_tag_edit(&file).unwrap();
+            assert_eq!(e.year, "2001", "{ext}");
+
+            // ändern: nur das Jahr
+            e.year = "1999".into();
+            write_tag_edit(&file, &e).unwrap();
+            assert_eq!(
+                read_tag_edit(&file).unwrap().year,
+                "1999",
+                "{ext}: Jahr geändert"
+            );
+            assert_eq!(read_meta(&file).year, Some(1999), "{ext}");
+            // Monat/Tag des ursprünglichen Datums bleiben erhalten
+            {
+                use lofty::file::TaggedFileExt;
+                let tagged = lofty::read_from_path(&file).unwrap();
+                let tag = tagged.primary_tag().or_else(|| tagged.first_tag()).unwrap();
+                let date = tag.date().unwrap();
+                assert_eq!(
+                    (date.year, date.month, date.day),
+                    (1999, Some(5), Some(6)),
+                    "{ext}"
+                );
+            }
+
+            // ungültig: nichts wird geschrieben
+            for bad in ["0", "10000", "abc"] {
+                e.year = bad.into();
+                assert!(
+                    write_tag_edit(&file, &e).is_err(),
+                    "{ext}: {bad} muss scheitern"
+                );
+            }
+            assert_eq!(read_tag_edit(&file).unwrap().year, "1999", "{ext}");
+
+            // entfernen
+            e.year = String::new();
+            write_tag_edit(&file, &e).unwrap();
+            assert_eq!(read_meta(&file).year, None, "{ext}: Jahr entfernt");
+            assert_eq!(
+                read_tag_edit(&file).unwrap().title,
+                "T",
+                "{ext}: andere Tags bleiben"
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

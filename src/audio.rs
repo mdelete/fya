@@ -1,32 +1,149 @@
 //! Audiowiedergabe über rodio. MP3/AAC laufen über symphonia (in rodio),
 //! Opus wird über ogg + libopus dekodiert und als rodio-Source eingespeist.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
+use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::source::SeekError;
-use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
+use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 use std::fs::File;
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+/// Anzeigename eines Geräts.
+fn device_name(d: &rodio::cpal::Device) -> Option<String> {
+    d.description().ok().map(|d| d.name().to_string())
+}
+
+/// Namen aller Ausgabegeräte (ohne Duplikate). Treiberabfrage – nicht im UI-Thread
+/// aufrufen.
+pub fn output_devices() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(devices) = rodio::cpal::default_host().output_devices() {
+        for name in devices.filter_map(|d| device_name(&d)) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// Öffnet einen Ausgabestrom: `Some(name)` = dieses Gerät, `None` = Systemstandard.
+/// Verschwindet das Gerät später (z. B. Bluetooth getrennt), meldet cpal das über den
+/// Fehler-Callback (ereignisgesteuert, ohne Nachfragen); `lost` wird dann gesetzt.
+/// Rückgabe: Strom + Name des geöffneten Geräts.
+fn open_stream(
+    name: Option<&str>,
+    lost: &Arc<AtomicBool>,
+) -> Result<(MixerDeviceSink, Option<String>)> {
+    let flag = lost.clone();
+    let on_error = move |e: rodio::cpal::Error| {
+        if e.kind() == rodio::cpal::ErrorKind::DeviceNotAvailable {
+            flag.store(true, Ordering::Relaxed);
+        }
+    };
+    let host = rodio::cpal::default_host();
+    let device = match name {
+        Some(name) => host
+            .output_devices()?
+            .find(|d| device_name(d).as_deref() == Some(name))
+            .ok_or_else(|| anyhow!("Ausgabegerät „{name}“ nicht gefunden"))?,
+        None => host
+            .default_output_device()
+            .ok_or_else(|| anyhow!("Kein Ausgabegerät gefunden"))?,
+    };
+    let device_name = device_name(&device);
+    let sink = DeviceSinkBuilder::from_device(device)?
+        .with_error_callback(on_error)
+        .open_sink_or_fallback()?;
+    Ok((sink, device_name))
+}
+
 pub struct Audio {
-    stream: OutputStream,
-    sink: Sink,
+    stream: MixerDeviceSink,
+    sink: Player,
     volume: f32,
     /// true, solange ein Titel geladen ist (spielend oder pausiert)
     active: bool,
+    /// Name des Geräts, auf dem der Strom läuft
+    device: Option<String>,
+    /// wird vom Fehler-Callback gesetzt, wenn das Gerät verschwindet
+    lost: Arc<AtomicBool>,
+    /// laufender Titel (für den Neustart beim Gerätewechsel)
+    current: Option<PathBuf>,
 }
 
 impl Audio {
+    /// Öffnet beim Start den Systemstandard. Danach wird nur noch auf ausdrücklich
+    /// gewählte Geräte gewechselt (siehe [`Audio::set_device`]).
     pub fn new() -> Result<Self> {
-        let stream = OutputStreamBuilder::open_default_stream()?;
-        let sink = Sink::connect_new(stream.mixer());
+        let lost = Arc::new(AtomicBool::new(false));
+        let (stream, device) = open_stream(None, &lost)?;
+        let sink = Player::connect_new(stream.mixer());
         Ok(Self {
             stream,
             sink,
             volume: 0.8,
             active: false,
+            device,
+            lost,
+            current: None,
         })
+    }
+
+    /// Name des Geräts, auf dem gerade ausgegeben wird.
+    pub fn device(&self) -> Option<&str> {
+        self.device.as_deref()
+    }
+
+    /// Wechselt das Ausgabegerät (`None` = Systemstandard, nur für die Wiederherstellung
+    /// gedacht). Ein laufender Titel wird auf dem neuen Gerät an derselben Position und
+    /// im selben Pausenzustand fortgesetzt. Bei einem Fehler bleibt der bisherige
+    /// Strom aktiv.
+    pub fn set_device(&mut self, name: Option<&str>) -> Result<()> {
+        let resume = match (&self.current, self.active) {
+            (Some(path), true) => Some((path.clone(), self.sink.get_pos(), self.sink.is_paused())),
+            _ => None,
+        };
+        let lost = Arc::new(AtomicBool::new(false));
+        let (stream, device) = open_stream(name, &lost)?; // scheitert -> nichts verändert
+
+        let old_stream = std::mem::replace(&mut self.stream, stream);
+        self.sink = Player::connect_new(self.stream.mixer()); // stoppt den alten Sink
+        self.sink.set_volume(self.volume);
+        drop(old_stream);
+        self.device = device;
+        self.lost = lost;
+
+        if let Some((path, pos, paused)) = resume {
+            if let Err(e) = self.play(&path) {
+                self.active = false;
+                return Err(e);
+            }
+            let _ = self.sink.try_seek(pos);
+            if paused {
+                self.sink.pause();
+            }
+        }
+        Ok(())
+    }
+
+    /// Ist das Gerät seit dem letzten Aufruf verschwunden? (einmalig; nur ein
+    /// atomares Flag, kein Treiberzugriff)
+    pub fn take_device_lost(&self) -> bool {
+        self.lost.swap(false, Ordering::Relaxed)
+    }
+
+    /// Gerät verschwunden: Wiedergabe pausieren und auf den Systemstandard umstellen
+    /// (Position bleibt erhalten, es läuft nichts von allein weiter).
+    pub fn recover_from_lost_device(&mut self) -> Result<()> {
+        if self.active {
+            self.sink.pause();
+        }
+        self.set_device(None)
     }
 
     pub fn play(&mut self, path: &Path) -> Result<()> {
@@ -37,7 +154,7 @@ impl Audio {
             .to_lowercase();
 
         // Neuen Sink anlegen; der alte wird beim Ersetzen gestoppt.
-        let sink = Sink::connect_new(self.stream.mixer());
+        let sink = Player::connect_new(self.stream.mixer());
         sink.set_volume(self.volume);
         match ext.as_str() {
             "opus" => sink.append(OpusSource::open(path)?),
@@ -45,6 +162,7 @@ impl Audio {
         }
         self.sink = sink;
         self.active = true;
+        self.current = Some(path.to_path_buf());
         Ok(())
     }
 
@@ -200,11 +318,11 @@ impl Source for OpusSource {
     fn current_span_len(&self) -> Option<usize> {
         None
     }
-    fn channels(&self) -> u16 {
-        self.channels
+    fn channels(&self) -> rodio::ChannelCount {
+        rodio::ChannelCount::new(self.channels).unwrap_or(rodio::ChannelCount::MIN)
     }
-    fn sample_rate(&self) -> u32 {
-        48_000
+    fn sample_rate(&self) -> rodio::SampleRate {
+        rodio::SampleRate::new(48_000).expect("48000 != 0")
     }
     fn total_duration(&self) -> Option<Duration> {
         None
@@ -258,4 +376,181 @@ fn packet_frame_size(data: &[u8]) -> Option<usize> {
     let total = frame * frames;
     // gültig: 1 Frame bis max. 120 ms (5760 Samples)
     (frames > 0 && total <= 5760).then_some(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stumme Testdatei via ffmpeg (None, wenn ffmpeg fehlt).
+    fn silent_file(dir: &Path, ext: &str, codec: &str, rate: u32, secs: u32) -> Option<PathBuf> {
+        let ffmpeg = crate::mixtape::find_ffmpeg()?;
+        let file = dir.join(format!("stumm.{ext}"));
+        let ok = std::process::Command::new(ffmpeg)
+            .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg(format!("anullsrc=r={rate}:cl=stereo"))
+            .args(["-t", &secs.to_string(), "-c:a", codec])
+            .arg(&file)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "{ext}: ffmpeg");
+        Some(file)
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("fya-audio-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Auflisten darf ohne Audiogerät (CI) nicht abstürzen; Namen sind eindeutig.
+    #[test]
+    fn geraeteliste_eindeutig() {
+        let names = output_devices();
+        eprintln!("Geräte: {names:?}");
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len());
+    }
+
+    /// Start auf dem Systemstandard; danach nur ausdrücklich gewählte Geräte.
+    #[test]
+    fn start_standard_dann_explizit() {
+        let Ok(mut audio) = Audio::new() else {
+            eprintln!("kein Ausgabegerät – übersprungen");
+            return;
+        };
+        let start = audio.device().map(str::to_string);
+        eprintln!("Start-Gerät: {start:?}");
+        let names = output_devices();
+        for name in names.iter().take(3) {
+            // manche Geräte verweigern das Öffnen – dann bleibt der alte Strom aktiv
+            match audio.set_device(Some(name)) {
+                Ok(()) => assert_eq!(audio.device(), Some(name.as_str())),
+                Err(e) => {
+                    eprintln!("{name}: {e}");
+                    assert_ne!(audio.device(), Some(name.as_str()));
+                }
+            }
+        }
+        let before = audio.device().map(str::to_string);
+        assert!(audio.set_device(Some("gibt-es-nicht")).is_err());
+        assert_eq!(
+            audio.device().map(str::to_string),
+            before,
+            "Fehler darf nichts verändern"
+        );
+        assert!(!audio.take_device_lost());
+    }
+
+    /// Gerätewechsel mitten im Titel: Position, Pausenzustand und Lautstärke bleiben.
+    #[test]
+    fn geraetewechsel_setzt_titel_fort() {
+        let dir = temp("switch");
+        let Some(file) = silent_file(&dir, "mp3", "libmp3lame", 44100, 5) else {
+            eprintln!("ffmpeg nicht installiert – übersprungen");
+            return;
+        };
+        let Ok(mut audio) = Audio::new() else {
+            eprintln!("kein Ausgabegerät – übersprungen");
+            return;
+        };
+        audio.set_volume(0.5);
+        audio.play(&file).unwrap();
+        audio.seek(Duration::from_secs(2)).unwrap();
+        audio.toggle_pause();
+        assert!(!audio.is_playing());
+
+        for name in output_devices().iter().take(2) {
+            if audio.set_device(Some(name)).is_err() {
+                continue; // Gerät verweigert das Öffnen
+            }
+            assert!(
+                audio.is_active() && !audio.is_playing(),
+                "Pause bleibt erhalten"
+            );
+            let pos = audio.position().as_secs_f32();
+            assert!(
+                (1.5..3.0).contains(&pos),
+                "Position {pos} s nach Wechsel auf {name}"
+            );
+            assert!((audio.volume() - 0.5).abs() < 1e-6);
+        }
+        audio.stop();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Gerät verschwindet (Fehler-Callback setzt das Flag): Wiedergabe wird pausiert,
+    /// Position bleibt, es läuft auf dem Systemstandard weiter – und das Flag ist danach
+    /// zurückgesetzt. Ohne Flag passiert nichts (kein automatisches Umschalten).
+    #[test]
+    fn verschwundenes_geraet_pausiert_und_stellt_standard_ein() {
+        let dir = temp("lost");
+        let Some(file) = silent_file(&dir, "mp3", "libmp3lame", 44100, 5) else {
+            eprintln!("ffmpeg nicht installiert – übersprungen");
+            return;
+        };
+        let Ok(mut audio) = Audio::new() else {
+            eprintln!("kein Ausgabegerät – übersprungen");
+            return;
+        };
+        let default_dev = audio.device().map(str::to_string);
+        audio.play(&file).unwrap();
+        audio.seek(Duration::from_secs(2)).unwrap();
+        assert!(audio.is_playing());
+        assert!(!audio.take_device_lost(), "ohne Ereignis kein Alarm");
+
+        audio.lost.store(true, Ordering::Relaxed); // wie der cpal-Fehler-Callback
+        assert!(audio.take_device_lost());
+        assert!(!audio.take_device_lost(), "einmalig");
+
+        audio.recover_from_lost_device().unwrap();
+        assert!(
+            audio.is_active() && !audio.is_playing(),
+            "pausiert, nicht gestoppt"
+        );
+        let pos = audio.position().as_secs_f32();
+        assert!((1.5..3.0).contains(&pos), "Position {pos} s");
+        assert_eq!(
+            audio.device().map(str::to_string),
+            default_dev,
+            "Systemstandard aktiv"
+        );
+        audio.stop();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Wiedergabe + Spulen für MP3, Opus und AAC.
+    #[test]
+    fn abspielen_und_spulen_mp3_opus_aac() {
+        let Ok(mut audio) = Audio::new() else {
+            eprintln!("kein Ausgabegerät – übersprungen");
+            return;
+        };
+        let dir = temp("play");
+        for (ext, codec) in [("mp3", "libmp3lame"), ("opus", "libopus"), ("m4a", "aac")] {
+            let Some(file) = silent_file(&dir, ext, codec, 48000, 6) else {
+                eprintln!("ffmpeg nicht installiert – übersprungen");
+                return;
+            };
+            audio
+                .play(&file)
+                .unwrap_or_else(|e| panic!("{ext}: play: {e:#}"));
+            assert!(audio.is_playing(), "{ext}");
+            audio
+                .seek(Duration::from_secs(3))
+                .unwrap_or_else(|e| panic!("{ext}: seek: {e:#}"));
+            let pos = audio.position().as_secs_f32();
+            assert!(
+                (2.0..4.5).contains(&pos),
+                "{ext}: Position {pos} s nach Spulen auf 3 s"
+            );
+            audio.stop();
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
