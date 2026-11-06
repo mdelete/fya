@@ -400,6 +400,7 @@ enum View {
     Playlists,
     MusicBrainz,
     Settings,
+    Help,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -683,7 +684,10 @@ impl PlayerApp {
     /// Wendet die Suche auf die MusicBrainz-Liste an (Künstler oder Album enthält
     /// den Suchbegriff; passt der Künstler, sind alle seine Alben sichtbar).
     fn refresh_mb_filter(&mut self) {
-        let query = self.filter.is_some().then(|| self.search.trim().to_lowercase());
+        let query = self
+            .filter
+            .is_some()
+            .then(|| self.search.trim().to_lowercase());
         self.mb_visible = self
             .mb_albums
             .iter()
@@ -698,7 +702,10 @@ impl PlayerApp {
             })
             .map(|(i, _)| i)
             .collect();
-        if self.mb_selected.is_some_and(|i| !self.mb_visible.contains(&i)) {
+        if self
+            .mb_selected
+            .is_some_and(|i| !self.mb_visible.contains(&i))
+        {
             self.mb_selected = None;
             self.mb_artist_image = None;
             self.mb_album_image = None;
@@ -762,13 +769,21 @@ impl PlayerApp {
             ) => Some(Message::Escape),
             (
                 Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(named @ (keyboard::key::Named::ArrowUp | keyboard::key::Named::ArrowDown)),
+                    key:
+                        keyboard::Key::Named(
+                            named @ (keyboard::key::Named::ArrowUp
+                            | keyboard::key::Named::ArrowDown),
+                        ),
                     modifiers,
                     ..
                 }),
                 _,
             ) if modifiers.alt() && !modifiers.command() => Some(Message::MovePlaylistTrack(
-                if named == keyboard::key::Named::ArrowUp { -1 } else { 1 },
+                if named == keyboard::key::Named::ArrowUp {
+                    -1
+                } else {
+                    1
+                },
             )),
             (
                 Event::Keyboard(keyboard::Event::KeyPressed {
@@ -888,16 +903,14 @@ impl PlayerApp {
                     return iced::widget::operation::focus(PLAYLIST_NAME_FIELD);
                 }
             }
-            Message::PlaylistName(v) => {
-                match &mut self.playlist_dialog {
-                    Some(PlaylistDialog::New { name, error, .. })
-                    | Some(PlaylistDialog::Rename { name, error, .. }) => {
-                        *name = v;
-                        *error = None;
-                    }
-                    _ => {}
+            Message::PlaylistName(v) => match &mut self.playlist_dialog {
+                Some(PlaylistDialog::New { name, error, .. })
+                | Some(PlaylistDialog::Rename { name, error, .. }) => {
+                    *name = v;
+                    *error = None;
                 }
-            }
+                _ => {}
+            },
             Message::ClosePlaylistDialog => self.playlist_dialog = None,
             Message::AskRenamePlaylist(id) => {
                 if let Some(p) = self.playlists.iter().find(|p| p.id == id) {
@@ -924,8 +937,12 @@ impl PlayerApp {
                     Ok(true) => {
                         self.select_playlist(Some(id));
                         // Abspielliste an die neue Reihenfolge angleichen
-                        let queue: Vec<Track> =
-                            self.pl_tracks.iter().filter(|t| !t.missing).cloned().collect();
+                        let queue: Vec<Track> = self
+                            .pl_tracks
+                            .iter()
+                            .filter(|t| !t.missing)
+                            .cloned()
+                            .collect();
                         if let Some(i) = queue.iter().position(|t| t.id == track_id) {
                             self.queue = queue;
                             self.queue_index = Some(i);
@@ -944,7 +961,8 @@ impl PlayerApp {
                 }
             }
             Message::AddToPlaylist(id) => {
-                if let Some(PlaylistDialog::AddTrack { path, error, .. }) = &mut self.playlist_dialog
+                if let Some(PlaylistDialog::AddTrack { path, error, .. }) =
+                    &mut self.playlist_dialog
                 {
                     match self.library.add_to_playlist(id, path) {
                         Ok(true) => {
@@ -1009,8 +1027,7 @@ impl PlayerApp {
                 if !matches!(
                     self.view,
                     View::Music | View::Compilations | View::Playlists
-                )
-                    || self.tag_editor.is_some()
+                ) || self.tag_editor.is_some()
                     || self.playlist_dialog.is_some()
                 {
                     return Task::none();
@@ -1506,6 +1523,7 @@ impl PlayerApp {
                     View::Playlists => self.playlists_view(),
                     View::MusicBrainz => self.musicbrainz_view(),
                     View::Settings => self.settings_view(),
+                    View::Help => self.help_view(),
                 };
                 let main = row![
                     self.sidebar(),
@@ -1614,7 +1632,8 @@ impl PlayerApp {
                 "MusicBrainz",
                 Message::ShowView(View::MusicBrainz)
             ),
-            entry(ICON_SETTINGS, "Settings", Message::ShowView(View::Settings))
+            entry(ICON_SETTINGS, "Settings", Message::ShowView(View::Settings)),
+            entry(ICON_HELP, "Help", Message::ShowView(View::Help))
         ]
         .spacing(4)
         .width(Length::Fixed(157.0))
@@ -1639,9 +1658,12 @@ impl PlayerApp {
             if kind == TagField::Title {
                 input = input.id(TAG_FIRST_FIELD);
             }
-            row![container(text(label).size(13).color(col().dim)).width(110), input]
-                .spacing(8)
-                .align_y(Alignment::Center)
+            row![
+                container(text(label).size(13).color(col().dim)).width(110),
+                input
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
         };
         let small = |label: &'static str, value: &str, kind: TagField| {
             let mut input = text_input("", value).padding(6).size(14).width(70);
@@ -1828,6 +1850,75 @@ impl PlayerApp {
     }
 
     /// Einstellungen (rechte Seite): Ort der Musikbibliothek, MusicBrainz.
+    /// Hilfe: alle Tasten + Danksagungen.
+    fn help_view(&self) -> Element<'_, Message> {
+        let c = col();
+        let key = |keys: &'static str, what: &'static str| -> Element<'static, Message> {
+            row![
+                container(text(keys).size(13).color(c.text))
+                    .padding([2, 8])
+                    .width(Length::Fixed(190.0))
+                    .style(move |_: &Theme| container::Style {
+                        background: Some(c.selected.into()),
+                        border: Border {
+                            color: c.border,
+                            width: 1.0,
+                            radius: 4.0.into(),
+                        },
+                        ..container::Style::default()
+                    }),
+                text(what).size(14),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .into()
+        };
+        let heading = |t: &'static str| text(t).size(12).color(c.dim);
+        let credit = |name: &'static str, what: &'static str, license: &'static str| {
+            column![
+                text(name).size(15),
+                text(what).size(13),
+                text(license).size(12).color(c.dim),
+            ]
+            .spacing(2)
+        };
+
+        let content = column![
+            heading("TASTEN"),
+            column![
+                key("Leertaste", "Wiedergabe starten / pausieren"),
+                key("t", "Metadaten (Tags) des laufenden Titels bearbeiten (Music, Compilations, Playlists)"),
+                key("p", "Laufenden Titel zu einer Playlist hinzufügen"),
+                key("Alt + ↑ / Alt + ↓", "Laufenden Titel in der Playlist nach oben / unten verschieben"),
+                key("Tab / Umschalt + Tab", "In Dialogen zum nächsten / vorherigen Feld wechseln"),
+                key("Enter", "In Dialogen speichern bzw. bestätigen"),
+                key("Esc", "Dialog schließen"),
+            ]
+            .spacing(8),
+            heading("MAUS"),
+            column![
+                key("Klick auf Titel", "Titel abspielen (die sichtbare Liste ist die Wiedergabeliste)"),
+                key("Suchfeld", "Sucht ab zwei Zeichen in Künstler, Album und Titel"),
+                key("Trennlinien ziehen", "Spaltenbreiten ändern"),
+                key("✎ / ✕ (Playlists)", "Playlist umbenennen / löschen bzw. Titel entfernen"),
+            ]
+            .spacing(8),
+            heading("ACKNOWLEDGEMENTS"),
+            text("FYA nutzt unter anderem freie Software von:").size(13),
+            column![
+                credit("iced", "Plattformübergreifende GUI-Bibliothek für Rust (iced.rs)", "MIT-Lizenz"),
+                credit("rodio", "Audio-Wiedergabe (github.com/RustAudio/rodio)", "MIT oder Apache-2.0"),
+                credit("lofty", "Lesen und Schreiben von Audio-Tags (github.com/Serial-ATA/lofty-rs)", "MIT oder Apache-2.0"),
+                credit("opus-rs", "Opus-Decoder in Rust (github.com/restsend/opus-rs)", "BSD-3-Clause"),
+                credit("Lucide", "Icons (lucide.dev)", "ISC-Lizenz"),
+            ]
+            .spacing(10),
+        ]
+        .spacing(14);
+
+        pane("HILFE", content.into())
+    }
+
     fn settings_view(&self) -> Element<'_, Message> {
         container(
             column![
@@ -1938,9 +2029,7 @@ impl PlayerApp {
             }
             r = r.push(text(fmt_time(t.duration_secs as u64)).color(col().dim));
             if removable {
-                r = r.push(
-                    small_x_button(Message::RemoveFromPlaylist(t.path.clone())),
-                );
+                r = r.push(small_x_button(Message::RemoveFromPlaylist(t.path.clone())));
             }
 
             list_button(r.into(), playing_id == Some(t.id), Message::PlayTrack(i))
@@ -2020,7 +2109,9 @@ impl PlayerApp {
             }
             PlaylistDialog::Delete { name, .. } => column![
                 text(format!("Playlist „{name}“ löschen?")).size(20),
-                text("Die Titeldateien bleiben erhalten.").size(13).color(col().dim),
+                text("Die Titeldateien bleiben erhalten.")
+                    .size(13)
+                    .color(col().dim),
                 row![
                     button("Abbrechen").on_press(Message::ClosePlaylistDialog),
                     button("Löschen").on_press(Message::ConfirmPlaylistDialog),
@@ -2086,7 +2177,13 @@ impl PlayerApp {
     fn compilations_view(&self) -> Element<'_, Message> {
         pane_grid(&self.comp_columns, |_, kind, _| {
             pane_grid::Content::new(match kind {
-                Column::Tracks => self.track_list(&self.comp_tracks, true, true, false),
+                Column::Tracks => self.track_list(
+                    &self.comp_tracks,
+                    true,
+                    // Album nur bei „Alle Alben“; bei einem gewählten Album ist es immer gleich
+                    self.comp_selected_album.is_none(),
+                    false,
+                ),
                 _ => {
                     let all = list_button(
                         text("Alle Alben").into(),
@@ -2122,21 +2219,22 @@ impl PlayerApp {
         let current = self.current_track();
         let (title, subtitle) = match (&self.status, current) {
             (Some(err), _) => (err.clone(), String::new()),
-            (None, Some(t)) => (
-                t.title.clone(),
-                {
-                    // Anzeigenamen aus den Tags statt der (bereinigten) Ordnernamen
-                    let artist = self
+            (None, Some(t)) => (t.title.clone(), {
+                // Anzeigenamen aus den Tags statt der (bereinigten) Ordnernamen
+                // Sammler-Ordner „Compilations“: Künstler des Titels aus dem Tag
+                let artist = match (&t.artist_tag, t.artist_name == COMPILATIONS) {
+                    (Some(tag), true) => tag,
+                    _ => self
                         .artist_names
                         .get(&t.artist_name)
-                        .unwrap_or(&t.artist_name);
-                    let album = self
-                        .album_titles
-                        .get(&(t.artist_name.clone(), t.album_title.clone()))
-                        .unwrap_or(&t.album_title);
-                    format!("{artist} — {album}")
-                },
-            ),
+                        .unwrap_or(&t.artist_name),
+                };
+                let album = self
+                    .album_titles
+                    .get(&(t.artist_name.clone(), t.album_title.clone()))
+                    .unwrap_or(&t.album_title);
+                format!("{artist} — {album}")
+            }),
             (None, None) => ("Kein Titel ausgewählt".to_string(), String::new()),
         };
 
@@ -2245,6 +2343,7 @@ const ICON_MUSIC: &[u8] = include_bytes!("../assets/icons/music.svg");
 const ICON_HEXAGON: &[u8] = include_bytes!("../assets/icons/hexagon.svg");
 const ICON_COMPILATIONS: &[u8] = include_bytes!("../assets/icons/list-music.svg");
 const ICON_PLAYLISTS: &[u8] = include_bytes!("../assets/icons/list-ordered.svg");
+const ICON_HELP: &[u8] = include_bytes!("../assets/icons/circle-help.svg");
 const ICON_SETTINGS: &[u8] = include_bytes!("../assets/icons/settings.svg");
 
 /// Einfarbiges SVG-Icon (Lucide-Icons nutzen `currentColor`, daher Farbfilter).
@@ -2380,14 +2479,22 @@ mod theme_tests {
         let mut schlecht = Vec::new();
         for theme in theme_options() {
             let c = colors_for(&theme);
-            for (name, surface) in [("panel", c.panel), ("selected", c.selected), ("hover", c.hover)] {
+            for (name, surface) in [
+                ("panel", c.panel),
+                ("selected", c.selected),
+                ("hover", c.hover),
+            ] {
                 let (t, d) = (contrast(c.text, surface), contrast(c.dim, surface));
                 if t < 4.0 || d < 2.0 {
                     schlecht.push(format!("{theme}/{name}: text {t:.1} dim {d:.1}"));
                 }
             }
         }
-        assert!(schlecht.is_empty(), "zu geringer Kontrast:\n{}", schlecht.join("\n"));
+        assert!(
+            schlecht.is_empty(),
+            "zu geringer Kontrast:\n{}",
+            schlecht.join("\n")
+        );
         assert_eq!(theme_options().len(), Theme::ALL.len() + 1);
     }
 }
