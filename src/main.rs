@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod audio;
+mod bpm;
 mod db;
 mod folder;
 mod mixtape;
@@ -309,6 +310,8 @@ enum Message {
     /// Einstellung: Mixtapes immer konvertieren (an/aus) bzw. Zielformat
     MixtapeConvert(bool),
     MixtapeFormat(mixtape::Format),
+    /// Einstellung: BPM der gespielten Titel analysieren (vorerst nur Log)
+    AnalyzeBpm(bool),
     /// Taste „p“: Titel zu Playlist hinzufügen
     OpenAddToPlaylist,
     NewPlaylist,
@@ -496,6 +499,8 @@ struct PlayerApp {
     mixtape_convert: bool,
     mixtape_format: mixtape::Format,
     ffmpeg: Option<PathBuf>,
+    /// BPM der gespielten Titel analysieren (Einstellung, Standard aus)
+    analyze_bpm: bool,
     /// Anzeigenamen aus den Tags: Künstler-Ordner -> Name, (Künstler-Ordner, Album-Ordner) -> Titel
     artist_names: std::collections::HashMap<String, String>,
     album_titles: std::collections::HashMap<(String, String), String>,
@@ -561,6 +566,7 @@ impl PlayerApp {
             theme: halloy_theme(),
             theme_options: theme_options(),
             mixtape_convert: false,
+            analyze_bpm: false,
             mixtape_format: mixtape::Format::Opus,
             ffmpeg: mixtape::find_ffmpeg(),
             artist_names: Default::default(),
@@ -602,6 +608,8 @@ impl PlayerApp {
         {
             app.mixtape_format = f;
         }
+        app.analyze_bpm = app.library.setting("bpm_analyze").as_deref() == Some("1");
+        app.audio.set_analyze_bpm(app.analyze_bpm);
         let task = app.restore_folder();
         (app, task)
     }
@@ -942,6 +950,18 @@ impl PlayerApp {
                 if let Err(e) = self
                     .library
                     .set_setting("mixtape_convert", if on { "1" } else { "0" })
+                {
+                    self.status = Some(format!(
+                        "Einstellung konnte nicht gespeichert werden: {e:#}"
+                    ));
+                }
+            }
+            Message::AnalyzeBpm(on) => {
+                self.analyze_bpm = on;
+                self.audio.set_analyze_bpm(on);
+                if let Err(e) = self
+                    .library
+                    .set_setting("bpm_analyze", if on { "1" } else { "0" })
                 {
                     self.status = Some(format!(
                         "Einstellung konnte nicht gespeichert werden: {e:#}"
@@ -2196,6 +2216,7 @@ impl PlayerApp {
                 credit("rodio", "Audio-Wiedergabe (github.com/RustAudio/rodio)", "MIT oder Apache-2.0"),
                 credit("lofty", "Lesen und Schreiben von Audio-Tags (github.com/Serial-ATA/lofty-rs)", "MIT oder Apache-2.0"),
                 credit("opus-rs", "Opus-Decoder in Rust (github.com/restsend/opus-rs)", "BSD-3-Clause"),
+                credit("bpm-analyzer", "BPM-Erkennung (github.com/not-jan/bpm-analyzer, lokal angepasst)", "MIT-Lizenz"),
                 credit("Lucide", "Icons (lucide.dev)", "ISC-Lizenz"),
             ]
             .spacing(10),
@@ -2249,6 +2270,10 @@ impl PlayerApp {
                 ),
                 text("Mixtape").size(12),
                 self.mixtape_setting(),
+                text("Analyse").size(12),
+                checkbox(self.analyze_bpm)
+                    .label("BPM der gespielten Titel analysieren")
+                    .on_toggle(Message::AnalyzeBpm),
             ]
             .spacing(12),
         )
@@ -2660,7 +2685,7 @@ impl PlayerApp {
             .seek_preview
             .unwrap_or_else(|| self.audio.position().as_secs_f32());
 
-        let controls = row![
+        let mut controls = row![
             icon_button(ICON_PREVIOUS, Message::Previous),
             icon_button(
                 if self.audio.is_playing() {
@@ -2678,14 +2703,26 @@ impl PlayerApp {
             ])
             .width(Length::Fill)
             .clip(true),
-            icon_button(ICON_SPEAKER, Message::ToggleDeviceMenu),
-            icon(ICON_VOLUME, 20.0, col().dim),
-            slider(0.0..=1.0, self.audio.volume(), Message::Volume)
-                .step(0.01 as f32)
-                .width(120),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center);
+        ];
+        // BPM-Anzeige (nur bei aktivierter Analyse), links vor dem Ausgabegerät; gleiche
+        // Größe und Farbe wie die Zeitanzeige
+        if self.analyze_bpm {
+            let bpm = match self.audio.current_bpm() {
+                Some(bpm) => format!("{} BPM", bpm.round() as i32),
+                None => "--- BPM".to_string(),
+            };
+            controls = controls.push(text(bpm).size(12));
+        }
+        let controls = controls
+            .push(icon_button(ICON_SPEAKER, Message::ToggleDeviceMenu))
+            .push(icon(ICON_VOLUME, 20.0, col().dim))
+            .push(
+                slider(0.0..=1.0, self.audio.volume(), Message::Volume)
+                    .step(0.01 as f32)
+                    .width(120),
+            )
+            .spacing(12)
+            .align_y(Alignment::Center);
 
         let progress = row![
             text(fmt_time(pos as u64)).size(12),

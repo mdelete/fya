@@ -74,6 +74,9 @@ pub struct Audio {
     lost: Arc<AtomicBool>,
     /// laufender Titel (für den Neustart beim Gerätewechsel)
     current: Option<PathBuf>,
+    /// BPM der gespielten Titel analysieren (Einstellung) + Analyse des laufenden Titels
+    analyze_bpm: bool,
+    analysis: Option<crate::bpm::Analysis>,
 }
 
 impl Audio {
@@ -91,6 +94,8 @@ impl Audio {
             device,
             lost,
             current: None,
+            analyze_bpm: false,
+            analysis: None,
         })
     }
 
@@ -156,14 +161,52 @@ impl Audio {
         // Neuen Sink anlegen; der alte wird beim Ersetzen gestoppt.
         let sink = Player::connect_new(self.stream.mixer());
         sink.set_volume(self.volume);
+        // Analyse des vorigen Titels beenden (der Thread endet, sobald sein Tap weg ist)
+        self.analysis = None;
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         match ext.as_str() {
-            "opus" => sink.append(OpusSource::open(path)?),
-            _ => sink.append(Decoder::try_from(File::open(path)?)?),
+            "opus" => self.append_source(&sink, OpusSource::open(path)?, label),
+            _ => self.append_source(&sink, Decoder::try_from(File::open(path)?)?, label),
         }
         self.sink = sink;
         self.active = true;
         self.current = Some(path.to_path_buf());
         Ok(())
+    }
+
+    /// Hängt die Quelle an; ist die BPM-Analyse an, läuft sie über einen Tap mit.
+    fn append_source<S>(&mut self, sink: &Player, source: S, label: String)
+    where
+        S: Source + Send + 'static,
+    {
+        let analysis = self
+            .analyze_bpm
+            .then(|| crate::bpm::start(label, source.sample_rate().get()))
+            .flatten();
+        match analysis {
+            Some((tx, analysis)) => {
+                sink.append(crate::bpm::Tap::new(source, tx));
+                self.analysis = Some(analysis);
+            }
+            None => sink.append(source),
+        }
+    }
+
+    /// BPM-Analyse der gespielten Titel ein-/ausschalten (gilt ab dem nächsten Titel).
+    pub fn set_analyze_bpm(&mut self, on: bool) {
+        self.analyze_bpm = on;
+        if !on {
+            self.analysis = None;
+        }
+    }
+
+    /// Zuletzt erkannte BPM des laufenden Titels (None: aus oder noch nichts erkannt).
+    /// (Anzeige im Player)
+    pub fn current_bpm(&self) -> Option<f32> {
+        self.analysis.as_ref().and_then(|a| a.latest_bpm())
     }
 
     pub fn toggle_pause(&mut self) {

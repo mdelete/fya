@@ -1,5 +1,10 @@
 # Lizenzen von Drittanbietern
 
+## bpm-analyzer
+
+Die BPM-Erkennung nutzt eine gepatchte Version von [`bpm-analyzer`](https://github.com/not-jan/bpm-analyzer) 0.2.0
+(MIT-Lizenz).
+
 ## Lucide Icons
 
 Die SVG-Icons in `assets/icons/` (außer `app-icon.png`) stammen von
