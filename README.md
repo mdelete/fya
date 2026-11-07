@@ -68,6 +68,10 @@ die .exe aber auch auf Anfrage über Actions. Beim Cross-Kompilieren von macOS/L
 Ordner wählen → Künstler → Album → Titel anklicken. Leertaste = Play/Pause,
 Slider unten = Spulen und Lautstärke.
 
+### Suche
+
+* Die Künstlerliste unter Music wird aus den Künstler-Ordnern gebaut, und „Compilations“ ist dabei bewusst ausgeblendet. Ein Künstler, der nur auf Samplern vorkommt, hat keinen Ordner und taucht in der Liste "Music" nicht auf, nur unter "Compilations" ist er zu finden.
+
 ## Links
 
  * [BPM Analyzer](https://github.com/not-jan/bpm-analyzer) (nicht eingebaut)
