@@ -376,6 +376,7 @@ enum TagField {
     TrackTotal,
     DiscNo,
     Year,
+    Bpm,
 }
 
 /// Zustand des modalen Tag-Editors
@@ -731,9 +732,8 @@ impl PlayerApp {
     /// Wendet die Suche auf die MusicBrainz-Liste an (Künstler oder Album enthält
     /// den Suchbegriff; passt der Künstler, sind alle seine Alben sichtbar).
     fn refresh_mb_filter(&mut self) {
-        let query = self
-            .filter
-            .is_some()
+        // Bei der BPM-Suche („:120“) gibt es in der MusicBrainz-Liste nichts zu filtern
+        let query = (self.filter.is_some() && !self.search.trim().starts_with(':'))
             .then(|| self.search.trim().to_lowercase());
         self.mb_visible = self
             .mb_albums
@@ -1326,6 +1326,7 @@ impl PlayerApp {
                         TagField::TrackTotal => &mut f.track_total,
                         TagField::DiscNo => &mut f.disc_no,
                         TagField::Year => &mut f.year,
+                        TagField::Bpm => &mut f.bpm,
                     } = value;
                     ed.error = None;
                 }
@@ -1478,7 +1479,14 @@ impl PlayerApp {
                 let query = self.search.trim().to_string();
                 // Jede Eingabe macht laufende Suchen ungültig.
                 let generation = self.search_generation.fetch_add(1, Ordering::Relaxed) + 1;
-                if query.chars().count() < 2 {
+                // „:120“ / „:120-130“ = BPM-Filter; ein Doppelpunkt mit ungültigem Rest
+                // (Buchstaben, mehr als drei Stellen …) filtert nichts
+                let bpm_query = query.starts_with(':').then(|| db::parse_bpm_query(&query));
+                let no_filter = match bpm_query {
+                    Some(range) => range.is_none(),
+                    None => query.chars().count() < 2,
+                };
+                if no_filter {
                     if self.filter.take().is_some() {
                         self.reload_library_view();
                         self.refresh_mb_filter();
@@ -1492,11 +1500,13 @@ impl PlayerApp {
                 // Eigener Thread mit niedriger Priorität, damit die UI flüssig bleibt.
                 std::thread::spawn(move || {
                     db::lower_thread_priority();
-                    let _ = tx.send(
-                        db::search(&db_path, &q, &counter, generation)
+                    let hits = match bpm_query.flatten() {
+                        Some((lo, hi)) => db::search_bpm(&db_path, lo, hi).ok(),
+                        None => db::search(&db_path, &q, &counter, generation)
                             .ok()
                             .flatten(),
-                    );
+                    };
+                    let _ = tx.send(hits);
                 });
                 return Task::perform(async move { rx.await.ok().flatten() }, move |hits| {
                     Message::SearchDone(query.clone(), hits)
@@ -1970,7 +1980,7 @@ impl PlayerApp {
             .align_y(Alignment::Center)
         };
         let small = |label: &'static str, value: &str, kind: TagField| {
-            let mut input = text_input("", value).padding(6).size(14).width(70);
+            let mut input = text_input("", value).padding(6).size(14).width(62);
             if !saving {
                 input = input
                     .on_input(move |v| Message::EditTag(kind, v))
@@ -2014,8 +2024,9 @@ impl PlayerApp {
                 small("von", &f.track_total, TagField::TrackTotal),
                 small("Disc", &f.disc_no, TagField::DiscNo),
                 small("Jahr", &f.year, TagField::Year),
+                small("BPM", &f.bpm, TagField::Bpm),
             ]
-            .spacing(16),
+            .spacing(12),
             compilation,
         ]
         .spacing(10);
@@ -2035,7 +2046,7 @@ impl PlayerApp {
             .spacing(8),
         );
 
-        let dialog = container(col).padding(20).max_width(560).style(panel_style);
+        let dialog = container(col).padding(20).max_width(600).style(panel_style);
 
         // Abgedunkelter Hintergrund; Klick daneben schließt, Klicks auf den Dialog nicht.
         opaque(
@@ -2202,7 +2213,7 @@ impl PlayerApp {
             heading("MAUS"),
             column![
                 key("Klick auf Titel", "Titel abspielen (die sichtbare Liste ist die Wiedergabeliste)"),
-                key("Suchfeld", "Sucht ab zwei Zeichen in Künstler, Album und Titel"),
+                key("Suchfeld", "Sucht ab zwei Zeichen in Künstler, Album und Titel; „:120“ oder „:120-130“ filtert nach BPM"),
                 key("Trennlinien ziehen", "Spaltenbreiten ändern"),
                 key("Lautsprecher-Knopf (Player)", "Ausgabegerät wählen (z. B. Bluetooth-Lautsprecher). Es wird nie automatisch gewechselt; verschwindet das Gerät, pausiert die Wiedergabe und der Systemstandard wird aktiv"),
                 key("❣️ (Playlists)", "Mixtape: Playlist als ZIP speichern (optional per ffmpeg konvertiert, siehe Einstellungen)"),

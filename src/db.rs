@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS tracks (
     compilation    INTEGER NOT NULL DEFAULT 0,
     disc_no        INTEGER NOT NULL DEFAULT 1,
     year           INTEGER,
-    duration_secs  INTEGER NOT NULL DEFAULT 0
+    duration_secs  INTEGER NOT NULL DEFAULT 0,
+    bpm            INTEGER  -- aus dem BPM-Tag (gerundet), NULL = kein Tag
 );
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
@@ -112,10 +113,29 @@ CREATE INDEX IF NOT EXISTS idx_tracks_album  ON tracks(album_id);
 
 /// Migration älterer Datenbanken auf das aktuelle Schema.
 /// (Siehe CLAUDE.md: Migrationscode bleibt, bis er ausdrücklich entfernt werden soll.)
-/// Derzeit nichts zu tun – bei der nächsten Schemaänderung hier wieder einbauen
-/// (neue Spalten per `ALTER TABLE`, ggf. Daten nachfüllen).
-fn migrate(_conn: &Connection) -> Result<()> {
+fn migrate(conn: &Connection) -> Result<()> {
+    // tracks.bpm: neu. Bestehende Zeilen bleiben NULL, bis die Mediathek neu eingelesen wird
+    // (die Tags stehen nur in den Dateien).
+    add_column(conn, "tracks", "bpm", "INTEGER")?;
     Ok(())
+}
+
+/// Fügt die Spalte hinzu, falls sie fehlt. Rückgabe: wurde sie neu angelegt?
+fn add_column(conn: &Connection, table: &str, column: &str, def: &str) -> Result<bool> {
+    let exists = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|c| c == column);
+    if exists {
+        return Ok(false);
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {def}"),
+        [],
+    )?;
+    Ok(true)
 }
 
 const TRACK_SELECT: &str = "
@@ -194,8 +214,8 @@ fn scan(conn: &mut Connection, root: &Path) -> Result<usize> {
                 tx.execute(
                     "INSERT INTO tracks(album_id, path, format, title, artist_tag, album_tag,
                                         album_artist_tag, composer, track_no, track_total,
-                                        compilation, disc_no, year, duration_secs)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                        compilation, disc_no, year, duration_secs, bpm)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     params![
                         album_id,
                         file.to_string_lossy(),
@@ -211,6 +231,7 @@ fn scan(conn: &mut Connection, root: &Path) -> Result<usize> {
                         meta.disc_no.unwrap_or(1),
                         meta.year,
                         meta.duration_secs,
+                        meta.bpm,
                     ],
                 )?;
                 if let Some(year) = meta.year {
@@ -671,6 +692,7 @@ struct Meta {
     compilation: bool,
     disc_no: Option<u32>,
     year: Option<u32>,
+    bpm: Option<u32>,
     duration_secs: u32,
 }
 
@@ -690,12 +712,10 @@ fn read_meta(path: &Path) -> Meta {
     };
 
     if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
-        meta.title = tag
-            .title()
-            .map(|s| s.into_owned())
-            .filter(|s| !s.trim().is_empty());
-        meta.artist = tag.artist().map(|s| s.into_owned());
-        meta.album = tag.album().map(|s| s.into_owned());
+        // Tags getrimmt lesen (ID3v1 füllt seine festen Felder oft mit Leerzeichen auf)
+        meta.title = clean_text(tag.title());
+        meta.artist = clean_text(tag.artist());
+        meta.album = clean_text(tag.album());
         meta.album_artist = text_item(tag, ItemKey::AlbumArtist);
         meta.composer = text_item(tag, ItemKey::Composer);
         meta.track_no = tag.track();
@@ -710,6 +730,12 @@ fn read_meta(path: &Path) -> Meta {
                 });
         meta.disc_no = tag.disk();
         meta.year = tag.date().map(|d| u32::from(d.year));
+        // Dezimal-BPM zuerst, sonst die ganzzahlige; als ganze Zahl (gerundet) gespeichert
+        meta.bpm = tag
+            .get_string(ItemKey::Bpm)
+            .or_else(|| tag.get_string(ItemKey::IntegerBpm))
+            .and_then(|b| parse_bpm(b).ok().flatten())
+            .map(|v| v.round() as u32);
     }
     meta
 }
@@ -780,8 +806,19 @@ pub fn read_cover(path: &Path) -> Option<Vec<u8>> {
 }
 
 fn text_item(tag: &lofty::tag::Tag, key: ItemKey) -> Option<String> {
-    tag.get_string(key)
-        .map(|s| s.trim().to_string())
+    clean_text(tag.get_string(key))
+}
+
+/// Tag-Text ohne Leerzeichen/Nullbytes an den Rändern; leer -> None. ID3v1 hat feste
+/// Feldbreiten (30 Zeichen), die ältere Programme mit Leerzeichen auffüllen; `lofty`
+/// entfernt davon nur Nullbytes.
+fn clean_text<S: AsRef<str>>(value: Option<S>) -> Option<String> {
+    value
+        .map(|s| {
+            s.as_ref()
+                .trim_matches(|c: char| c.is_whitespace() || c == '\0')
+                .to_string()
+        })
         .filter(|s| !s.is_empty())
 }
 
@@ -1002,13 +1039,7 @@ pub fn search(
     // Sampler: Titel eines Künstlers (über den Künstler-Tag) gehören zu diesem Künstler.
     // Passt der Künstler oder der Titel selbst, ist der Titel samt Album sichtbar, und der
     // Künstler erscheint in der Künstlerliste.
-    let find_artist = |tag: &str| -> Option<i64> {
-        artist_names
-            .iter()
-            .filter(|(_, name)| name.as_str() != "Compilations")
-            .find(|(_, name)| tag.eq_ignore_ascii_case(name) || tag_matches_folder(tag, name))
-            .map(|(id, _)| *id)
-    };
+    let find_artist = |tag: &str| find_artist_for_tag(&artist_names, tag);
     for (comp_id, al, t, tag) in comp_rows {
         let Some(artist) = find_artist(&tag) else {
             continue;
@@ -1021,6 +1052,79 @@ pub fn search(
         }
     }
     Ok(Some(hits))
+}
+
+/// Künstler (ID) zu einem Künstler-Tag: Name gleich (ohne Groß-/Kleinschreibung) oder bis auf
+/// ersetzte Sonderzeichen gleich dem Ordnernamen. „Compilations“ selbst zählt nicht.
+fn find_artist_for_tag(
+    artists: &std::collections::HashMap<i64, String>,
+    tag: &str,
+) -> Option<i64> {
+    artists
+        .iter()
+        .filter(|(_, name)| name.as_str() != "Compilations")
+        .find(|(_, name)| tag.eq_ignore_ascii_case(name) || tag_matches_folder(tag, name))
+        .map(|(id, _)| *id)
+}
+
+/// BPM-Suche im Suchfeld: beginnt die Eingabe mit `:`, wird nach BPM gefiltert.
+/// `:X` (ganze Zahl, höchstens dreistellig) ergibt `X-5 … X+5`, `:X-Y` (zwei solche
+/// Zahlen) `X … Y` (bei vertauschter Reihenfolge sortiert). Alles andere (kein Doppelpunkt,
+/// Buchstaben, mehr als drei Stellen, mehr Teile) ergibt `None`.
+pub fn parse_bpm_query(query: &str) -> Option<(u32, u32)> {
+    let rest = query.trim().strip_prefix(':')?;
+    let num = |s: &str| -> Option<u32> {
+        (!s.is_empty() && s.len() <= 3 && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse().ok())
+            .flatten()
+    };
+    match rest.split_once('-') {
+        None => {
+            let x = num(rest)?;
+            Some((x.saturating_sub(5), x + 5))
+        }
+        Some((a, b)) => {
+            let (x, y) = (num(a)?, num(b)?);
+            Some((x.min(y), x.max(y)))
+        }
+    }
+}
+
+/// Titel mit `bpm BETWEEN lo AND hi` samt Album und Künstler. Es erscheinen nur die
+/// passenden Titel (nicht das ganze Album). Titel im Ordner „Compilations“ gehören über
+/// den Künstler-Tag zu ihrem Künstler (wie bei [`search`]). Eigene Verbindung, läuft auf
+/// einem Worker-Thread.
+pub fn search_bpm(db_path: &Path, lo: u32, hi: u32) -> Result<SearchHits> {
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("Datenbank öffnen: {}", db_path.display()))?;
+    let artist_names: std::collections::HashMap<i64, String> = conn
+        .prepare("SELECT id, name FROM artists")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut hits = SearchHits::default();
+    let mut st = conn.prepare(
+        "SELECT ar.id, ar.name, al.id, t.id, t.artist_tag
+         FROM tracks t
+         JOIN albums al ON al.id = t.album_id
+         JOIN artists ar ON ar.id = al.artist_id
+         WHERE t.bpm BETWEEN ?1 AND ?2",
+    )?;
+    let mut rows = st.query(params![lo, hi])?;
+    while let Some(r) = rows.next()? {
+        let (ar_id, ar_name): (i64, String) = (r.get(0)?, r.get(1)?);
+        let (al_id, t_id): (i64, i64) = (r.get(2)?, r.get(3)?);
+        let tag: Option<String> = r.get(4)?;
+        hits.tracks.insert(t_id);
+        hits.albums.insert(al_id);
+        hits.artists.insert(ar_id);
+        if ar_name == "Compilations" {
+            if let Some(artist) = tag.and_then(|t| find_artist_for_tag(&artist_names, &t)) {
+                hits.artists.insert(artist);
+            }
+        }
+    }
+    Ok(hits)
 }
 
 /// Setzt den aktuellen Thread auf niedrige Priorität (Hintergrund).
@@ -1065,12 +1169,30 @@ pub struct TagEdit {
     pub track_total: String,
     pub disc_no: String,
     pub year: String,
+    /// BPM als Text (Zahl, ggf. mit Nachkommastellen)
+    pub bpm: String,
     pub compilation: bool,
 }
 
 fn opt(s: &str) -> Option<String> {
     let t = s.trim();
     (!t.is_empty()).then(|| t.to_string())
+}
+
+/// BPM aus dem Eingabefeld: leer = keiner, sonst Zahl > 0 und ≤ 999 (Komma oder Punkt).
+fn parse_bpm(s: &str) -> Result<Option<f32>> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let v: f32 = t
+        .replace(',', ".")
+        .parse()
+        .map_err(|_| anyhow::anyhow!("BPM: „{t}“ ist keine Zahl"))?;
+    if !v.is_finite() || v <= 0.0 || v > 999.0 {
+        bail!("BPM: „{t}“ ist ungültig (größer 0, höchstens 999)");
+    }
+    Ok(Some(v))
 }
 
 fn parse_num(label: &str, s: &str) -> Result<Option<u32>> {
@@ -1088,8 +1210,7 @@ pub fn read_tag_edit(path: &Path) -> Result<TagEdit> {
     let tagged = lofty::read_from_path(path)?;
     let mut e = TagEdit::default();
     if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
-        let s =
-            |v: Option<std::borrow::Cow<'_, str>>| v.map(|c| c.into_owned()).unwrap_or_default();
+        let s = |v: Option<std::borrow::Cow<'_, str>>| clean_text(v).unwrap_or_default();
         let n = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_default();
         e.title = s(tag.title());
         e.artist = s(tag.artist());
@@ -1101,6 +1222,13 @@ pub fn read_tag_edit(path: &Path) -> Result<TagEdit> {
         e.track_total = n(tag.track_total());
         e.disc_no = n(tag.disk());
         e.year = n(tag.date().map(|d| u32::from(d.year)));
+        // Formate mit Dezimal-BPM (Vorbis/Opus, MP4-Freiform) zuerst, sonst die ganzzahlige
+        // (ID3 `TBPM`, MP4 `tmpo`)
+        e.bpm = tag
+            .get_string(ItemKey::Bpm)
+            .or_else(|| tag.get_string(ItemKey::IntegerBpm))
+            .map(|b| b.trim().to_string())
+            .unwrap_or_default();
         e.compilation = tag
             .get(ItemKey::FlagCompilation)
             .is_some_and(|item| match item.value() {
@@ -1124,6 +1252,7 @@ impl TagEdit {
                 bail!("Jahr: „{y}“ ist ungültig (1–9999)");
             }
         }
+        parse_bpm(&self.bpm)?;
         Ok(())
     }
 }
@@ -1194,6 +1323,18 @@ pub fn write_tag_edit(path: &Path, e: &TagEdit) -> Result<()> {
         }
         None => tag.remove_date(),
     }
+    // BPM: Dezimalwert dort, wo das Format ihn kennt, und der gerundete Ganzzahlwert dort,
+    // wo es nur ganze BPM gibt (ID3 `TBPM`, MP4 `tmpo`); nicht passende Felder bleiben aus
+    match parse_bpm(&e.bpm)? {
+        Some(v) => {
+            tag.insert_text(ItemKey::Bpm, v.to_string());
+            tag.insert_text(ItemKey::IntegerBpm, (v.round() as u32).to_string());
+        }
+        None => {
+            tag.remove_key(ItemKey::Bpm);
+            tag.remove_key(ItemKey::IntegerBpm);
+        }
+    }
     if e.compilation {
         tag.insert_text(ItemKey::FlagCompilation, "1".to_string());
     } else {
@@ -1211,8 +1352,8 @@ impl Library {
         self.conn.execute(
             "UPDATE tracks SET title = ?1, artist_tag = ?2, album_tag = ?3,
                     album_artist_tag = ?4, composer = ?5, track_no = ?6, track_total = ?7,
-                    compilation = ?8, disc_no = ?9, year = ?10
-             WHERE id = ?11",
+                    compilation = ?8, disc_no = ?9, year = ?10, bpm = ?11
+             WHERE id = ?12",
             params![
                 title,
                 opt(&e.artist),
@@ -1224,6 +1365,7 @@ impl Library {
                 e.compilation,
                 parse_num("Disc", &e.disc_no)?.unwrap_or(1),
                 parse_num("Jahr", &e.year)?,
+                parse_bpm(&e.bpm)?.map(|v| v.round() as i64),
                 id
             ],
         )?;
@@ -1509,6 +1651,299 @@ mod year_tests {
                 "{ext}: andere Tags bleiben"
             );
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod bpm_tag_tests {
+    use super::*;
+
+    /// BPM-Tag im Editor: lesen, schreiben (ganzzahlig und dezimal, je nach Format),
+    /// ungültige Eingaben, entfernen. Braucht ffmpeg (sonst übersprungen).
+    #[test]
+    fn bpm_lesen_schreiben_entfernen() {
+        let Some(ffmpeg) = crate::mixtape::find_ffmpeg() else {
+            eprintln!("ffmpeg nicht installiert – übersprungen");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("fya-bpmtag-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // (Endung, Codec, Dezimal-BPM bleibt erhalten?)
+        for (ext, codec, decimal) in [("mp3", "libmp3lame", false), ("opus", "libopus", true), ("m4a", "aac", true)] {
+            let file = dir.join(format!("t.{ext}"));
+            let ok = std::process::Command::new(&ffmpeg)
+                .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1"])
+                .args(["-metadata", "title=T", "-c:a", codec])
+                .arg(&file)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{ext}: ffmpeg");
+            let mut e = read_tag_edit(&file).unwrap();
+            assert_eq!(e.bpm, "", "{ext}: anfangs kein BPM");
+
+            // ganzzahlig
+            e.bpm = "128".into();
+            write_tag_edit(&file, &e).unwrap();
+            assert_eq!(read_tag_edit(&file).unwrap().bpm, "128", "{ext}: ganzzahlig");
+
+            // dezimal (Komma erlaubt): ID3 kennt nur ganze BPM -> gerundet
+            e.bpm = "127,6".into();
+            write_tag_edit(&file, &e).unwrap();
+            let expect = if decimal { "127.6" } else { "128" };
+            assert_eq!(read_tag_edit(&file).unwrap().bpm, expect, "{ext}: dezimal");
+
+            // ungültig: nichts wird geschrieben
+            for bad in ["abc", "0", "-5", "1000", "NaN"] {
+                e.bpm = bad.into();
+                assert!(write_tag_edit(&file, &e).is_err(), "{ext}: „{bad}“ muss scheitern");
+                assert!(e.validate().is_err());
+            }
+            assert_eq!(read_tag_edit(&file).unwrap().bpm, expect, "{ext}: unverändert");
+
+            // entfernen; andere Tags bleiben
+            e.bpm = String::new();
+            write_tag_edit(&file, &e).unwrap();
+            let back = read_tag_edit(&file).unwrap();
+            assert_eq!(back.bpm, "", "{ext}: entfernt");
+            assert_eq!(back.title, "T", "{ext}: andere Tags bleiben");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod bpm_db_tests {
+    use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fya-bpmdb-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn suchsyntax_fuer_bpm() {
+        // :X -> X-5 … X+5
+        assert_eq!(parse_bpm_query(":120"), Some((115, 125)));
+        assert_eq!(parse_bpm_query("  :120  "), Some((115, 125)));
+        assert_eq!(parse_bpm_query(":3"), Some((0, 8))); // nie negativ
+        assert_eq!(parse_bpm_query(":999"), Some((994, 1004)));
+        // :X-Y -> X … Y (sortiert)
+        assert_eq!(parse_bpm_query(":120-130"), Some((120, 130)));
+        assert_eq!(parse_bpm_query(":130-120"), Some((120, 130)));
+        assert_eq!(parse_bpm_query(":7-9"), Some((7, 9)));
+        // nicht interpretiert: nur ganze, höchstens dreistellige Zahlen
+        for bad in [
+            "", ":", ":-", ":1000", ":1234", ":12a", ":abc", ":12.5", ":12,5", ":-5", ":5-", ":1-2-3",
+            ":12 - 14", ": 12", "120", "a:120", ":１２０",
+        ] {
+            assert_eq!(parse_bpm_query(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn bpm_suche_zeigt_nur_passende_titel_auch_aus_samplern() {
+        let dir = temp("search");
+        let lib = Library::open(&dir.join("library.db")).unwrap();
+        lib.conn
+            .execute_batch(
+                "INSERT INTO artists(id, name, sort_name, path) VALUES (1,'The Prodigy','prodigy','/p'), (2,'Compilations','compilations','/c'), (3,'Other','other','/o');
+                 INSERT INTO albums(id, artist_id, title, path) VALUES (10,1,'Fat','/p/fat'), (20,2,'Now 1','/c/now1'), (30,3,'Else','/o/else');
+                 INSERT INTO tracks(id, album_id, path, format, title, artist_tag, album_tag, bpm) VALUES
+                   (100,10,'/p/fat/a.mp3','mp3','Firestarter','The Prodigy','Fat',128),
+                   (101,10,'/p/fat/b.mp3','mp3','Slow','The Prodigy','Fat',90),
+                   (102,10,'/p/fat/c.mp3','mp3','Ohne Tag','The Prodigy','Fat',NULL),
+                   (200,20,'/c/now1/a.mp3','mp3','Breathe','the prodigy','Now 1',130),
+                   (201,20,'/c/now1/b.mp3','mp3','Other Song','Someone Else','Now 1',129),
+                   (300,30,'/o/else/a.mp3','mp3','Zzz','Other','Else',140);",
+            )
+            .unwrap();
+        let db = dir.join("library.db");
+
+        // :128 -> 123…133
+        let h = search_bpm(&db, 123, 133).unwrap();
+        let mut tracks: Vec<_> = h.tracks.iter().copied().collect();
+        tracks.sort();
+        assert_eq!(tracks, [100, 200, 201], "nur passende Titel, nicht ganze Alben");
+        assert!(h.albums.contains(&10) && h.albums.contains(&20) && !h.albums.contains(&30));
+        // Künstler: Prodigy (eigener Titel + Sampler-Titel per Tag), Compilations (Album)
+        assert!(h.artists.contains(&1) && h.artists.contains(&2) && !h.artists.contains(&3));
+
+        // Bereichsgrenzen sind inklusiv (BETWEEN)
+        let h = search_bpm(&db, 128, 129).unwrap();
+        assert!(h.tracks.contains(&100) && h.tracks.contains(&201) && !h.tracks.contains(&200));
+        // nichts passt
+        assert!(search_bpm(&db, 200, 210).unwrap().tracks.is_empty());
+        // Titel ohne BPM nie
+        assert!(!search_bpm(&db, 0, 999).unwrap().tracks.contains(&102));
+        drop(lib);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Alte Datenbank ohne `tracks.bpm`: `Library::open` legt die Spalte an, vorhandene
+    /// Zeilen bleiben NULL und die Daten bleiben erhalten.
+    #[test]
+    fn migration_legt_bpm_spalte_an() {
+        let dir = temp("migrate");
+        let path = dir.join("library.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT NOT NULL, sort_name TEXT NOT NULL DEFAULT '', mbid TEXT, path TEXT NOT NULL UNIQUE);
+                 CREATE TABLE albums (id INTEGER PRIMARY KEY, artist_id INTEGER NOT NULL, title TEXT NOT NULL, year INTEGER, mbid TEXT, path TEXT NOT NULL UNIQUE);
+                 CREATE TABLE tracks (id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, path TEXT NOT NULL UNIQUE, format TEXT NOT NULL, title TEXT NOT NULL, artist_tag TEXT, album_tag TEXT, track_no INTEGER, track_total INTEGER, album_artist_tag TEXT, composer TEXT, compilation INTEGER NOT NULL DEFAULT 0, disc_no INTEGER NOT NULL DEFAULT 1, year INTEGER, duration_secs INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO artists(id,name,path) VALUES (1,'A','/a');
+                 INSERT INTO albums(id,artist_id,title,path) VALUES (1,1,'Alb','/a/alb');
+                 INSERT INTO tracks(id,album_id,path,format,title) VALUES (1,1,'/a/alb/x.mp3','mp3','X');",
+            )
+            .unwrap();
+        }
+        let lib = Library::open(&path).unwrap();
+        let bpm: Option<i64> = lib
+            .conn
+            .query_row("SELECT bpm FROM tracks WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bpm, None);
+        // zweites Öffnen ist unproblematisch (Spalte existiert schon)
+        drop(lib);
+        let lib = Library::open(&path).unwrap();
+        assert_eq!(lib.tracks_by_artist(1).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Scan liest den BPM-Tag (MP3 `TBPM` ganzzahlig, Opus `BPM` dezimal -> gerundet) in die
+    /// Datenbank; der Tag-Editor schreibt Änderungen in die Datenbank. Braucht ffmpeg.
+    #[test]
+    fn scan_und_tag_editor_uebernehmen_bpm() {
+        let Some(ffmpeg) = crate::mixtape::find_ffmpeg() else {
+            eprintln!("ffmpeg nicht installiert – übersprungen");
+            return;
+        };
+        let dir = temp("scan");
+        let root = dir.join("musik");
+        let album = root.join("Künstler").join("Album");
+        std::fs::create_dir_all(&album).unwrap();
+        for (name, codec, tag) in [
+            ("a.mp3", "libmp3lame", "TBPM=128"),
+            ("b.opus", "libopus", "BPM=127.6"),
+            ("c.mp3", "libmp3lame", "title=OhneBpm"),
+        ] {
+            let ok = std::process::Command::new(&ffmpeg)
+                .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1"])
+                .args(["-metadata", tag, "-c:a", codec])
+                .arg(album.join(name))
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{name}: ffmpeg");
+        }
+        let db = dir.join("library.db");
+        Library::open(&db).unwrap();
+        assert_eq!(rebuild_from(&db, &root).unwrap(), 3);
+
+        let lib = Library::open(&db).unwrap();
+        let bpm_of = |file: &str| -> Option<i64> {
+            lib.conn
+                .query_row(
+                    "SELECT bpm FROM tracks WHERE path LIKE ?1",
+                    [format!("%{file}")],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(bpm_of("a.mp3"), Some(128));
+        assert_eq!(bpm_of("b.opus"), Some(128), "127.6 gerundet");
+        assert_eq!(bpm_of("c.mp3"), None);
+        assert_eq!(search_bpm(&db, 123, 133).unwrap().tracks.len(), 2);
+
+        // Tag-Editor: Änderung landet auch in der Datenbank
+        let (id, path): (i64, String) = lib
+            .conn
+            .query_row("SELECT id, path FROM tracks WHERE path LIKE '%c.mp3'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let mut e = read_tag_edit(Path::new(&path)).unwrap();
+        e.bpm = "99,6".into();
+        lib.update_track_tags(id, Path::new(&path), &e).unwrap();
+        assert_eq!(bpm_of("c.mp3"), Some(100));
+        e.bpm = String::new();
+        lib.update_track_tags(id, Path::new(&path), &e).unwrap();
+        assert_eq!(bpm_of("c.mp3"), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+
+    #[test]
+    fn clean_text_schneidet_leerzeichen_und_nullbytes() {
+        assert_eq!(clean_text(Some("Try Again                     ")).as_deref(), Some("Try Again"));
+        assert_eq!(clean_text(Some("  Alb um\0\0 ")).as_deref(), Some("Alb um"));
+        assert_eq!(clean_text(Some("a  b")).as_deref(), Some("a  b")); // innen unverändert
+        assert_eq!(clean_text(Some("      ")), None);
+        assert_eq!(clean_text(Some("")), None);
+        assert_eq!(clean_text(None::<&str>), None);
+    }
+
+    /// MP3 mit reinem ID3v1-Tag, dessen Felder mit Leerzeichen aufgefüllt sind (wie
+    /// „Try Again.mp3“): Scan und Tag-Editor liefern getrimmte Werte. Braucht ffmpeg.
+    #[test]
+    fn id3v1_mit_leerzeichen_wird_getrimmt_gelesen() {
+        let Some(ffmpeg) = crate::mixtape::find_ffmpeg() else {
+            eprintln!("ffmpeg nicht installiert – übersprungen");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("fya-trim-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("t.mp3");
+        let ok = std::process::Command::new(ffmpeg)
+            .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "1"])
+            .args(["-write_id3v2", "0", "-write_id3v1", "0", "-c:a", "libmp3lame"])
+            .arg(&file)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+
+        // ID3v1-Block (128 Byte) von Hand anhängen, Felder mit Leerzeichen aufgefüllt
+        let pad = |s: &str, n: usize| format!("{s:<n$}");
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"TAG");
+        tag.extend_from_slice(pad("Try Again", 30).as_bytes());
+        tag.extend_from_slice(pad("Aaliyah", 30).as_bytes());
+        tag.extend_from_slice(pad("Romeo Must Die Soundtrack", 30).as_bytes());
+        tag.extend_from_slice(pad("2000", 4).as_bytes());
+        tag.extend_from_slice(pad("", 30).as_bytes()); // Kommentar
+        tag.push(255); // kein Genre
+        assert_eq!(tag.len(), 128);
+        let mut bytes = std::fs::read(&file).unwrap();
+        // ffmpeg legt trotzdem einen (leeren) ID3v2-Kopf an: entfernen, damit nur ID3v1 bleibt
+        if bytes.starts_with(b"ID3") {
+            let size = bytes[6..10].iter().fold(0usize, |n, b| (n << 7) | usize::from(b & 0x7f));
+            bytes.drain(..10 + size);
+        }
+        bytes.extend_from_slice(&tag);
+        std::fs::write(&file, bytes).unwrap();
+
+        let meta = read_meta(&file);
+        assert_eq!(meta.title.as_deref(), Some("Try Again"));
+        assert_eq!(meta.artist.as_deref(), Some("Aaliyah"));
+        assert_eq!(meta.album.as_deref(), Some("Romeo Must Die Soundtrack"));
+
+        let e = read_tag_edit(&file).unwrap();
+        assert_eq!(
+            (e.title.as_str(), e.artist.as_str(), e.album.as_str()),
+            ("Try Again", "Aaliyah", "Romeo Must Die Soundtrack")
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }
