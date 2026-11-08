@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod audio;
+#[cfg(feature = "bpm")]
 mod bpm;
 mod db;
 mod folder;
@@ -612,7 +613,9 @@ impl PlayerApp {
         {
             app.mixtape_format = f;
         }
-        app.analyze_bpm = app.library.setting("bpm_analyze").as_deref() == Some("1");
+        // ohne das Feature `bpm` gibt es die Analyse (und ihre Einstellung) nicht
+        app.analyze_bpm =
+            cfg!(feature = "bpm") && app.library.setting("bpm_analyze").as_deref() == Some("1");
         app.audio.set_analyze_bpm(app.analyze_bpm);
         let task = app.restore_folder();
         (app, task)
@@ -2230,9 +2233,15 @@ impl PlayerApp {
                 credit("rodio", "Audio-Wiedergabe (github.com/RustAudio/rodio)", "MIT oder Apache-2.0"),
                 credit("lofty", "Lesen und Schreiben von Audio-Tags (github.com/Serial-ATA/lofty-rs)", "MIT oder Apache-2.0"),
                 credit("opus-rs", "Opus-Decoder in Rust (github.com/restsend/opus-rs)", "BSD-3-Clause"),
-                credit("bpm-analyzer", "BPM-Erkennung (github.com/not-jan/bpm-analyzer, lokal angepasst)", "MIT-Lizenz"),
                 credit("Lucide", "Icons (lucide.dev)", "ISC-Lizenz"),
             ]
+            .extend(cfg!(feature = "bpm").then(|| {
+                Element::from(credit(
+                    "bpm-analyzer",
+                    "BPM-Erkennung (github.com/not-jan/bpm-analyzer)",
+                    "MIT-Lizenz",
+                ))
+            }))
             .spacing(10),
         ]
         .spacing(14);
@@ -2284,11 +2293,19 @@ impl PlayerApp {
                 ),
                 text("Mixtape").size(12),
                 self.mixtape_setting(),
-                text("Analyse").size(12),
-                checkbox(self.analyze_bpm)
-                    .label("BPM der gespielten Titel analysieren")
-                    .on_toggle(Message::AnalyzeBpm),
             ]
+            // BPM-Analyse: nur mit dem Feature `bpm`
+            .extend(if cfg!(feature = "bpm") {
+                vec![
+                    text("Analyse").size(12).into(),
+                    checkbox(self.analyze_bpm)
+                        .label("BPM der gespielten Titel analysieren")
+                        .on_toggle(Message::AnalyzeBpm)
+                        .into(),
+                ]
+            } else {
+                Vec::<Element<'_, Message>>::new()
+            })
             .spacing(12),
         )
         .padding(16)

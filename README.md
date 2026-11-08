@@ -64,6 +64,18 @@ Konsolenfenster). Daten liegen unter `%APPDATA%\fya\`. Die CI (`.github/workflow
 die .exe aber auch auf Anfrage über Actions. Beim Cross-Kompilieren von macOS/Linux
 (`--target x86_64-pc-windows-gnu`, benötigt mingw-w64 (brew install mingw-w64)) wird das Icon nicht eingebettet.
 
+## Cargo-Features
+| Feature | Standard | Wirkung |
+|---|---|---|
+| `bpm` | an | BPM-Erkennung der gespielten Titel (`bpm-analyzer`): Einstellung „BPM … analysieren“ und BPM-Anzeige im Player. Ohne das Feature entfallen die Abhängigkeit samt DSP-Crates (Binary ca. 0,5 MB kleiner) und diese Oberfläche; die BPM-**Tags** (Tag-Editor, Suche `:120`) bleiben. |
+| `ogg` | aus | Ogg (Vorbis, FLAC, Opus) und natives FLAC, siehe unten. |
+
+```
+cargo build --release                                    # Standard (bpm)
+cargo build --release --no-default-features              # ohne BPM-Erkennung
+cargo build --release --features ogg                     # Standard + Ogg/FLAC
+```
+
 ## Optional: Ogg und FLAC (`--features ogg`)
 Standardmäßig spielt FYA `mp3`, `aac`, `m4a` und `opus`. Mit dem Cargo-Feature `ogg` kommen
 `ogg`/`oga` (Vorbis, FLAC in Ogg, Opus in Ogg) und natives `flac` dazu:
@@ -88,7 +100,3 @@ Slider unten = Spulen und Lautstärke.
 ### Suche
 
 * Die Künstlerliste unter Music wird aus den Künstler-Ordnern gebaut, und „Compilations“ ist dabei bewusst ausgeblendet. Ein Künstler, der nur auf Samplern vorkommt, hat keinen Ordner und taucht in der Liste "Music" nicht auf, nur unter "Compilations" ist er zu finden.
-
-## Links
-
- * [BPM Analyzer](https://github.com/not-jan/bpm-analyzer) (nicht eingebaut)

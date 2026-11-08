@@ -12,6 +12,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+/// Ergebnis-Zugriff der BPM-Analyse des laufenden Titels. Ohne das Feature `bpm` gibt es keine
+/// Analyse: der Platzhalter wird nie erzeugt.
+#[cfg(feature = "bpm")]
+type Analysis = crate::bpm::Analysis;
+#[cfg(not(feature = "bpm"))]
+#[allow(dead_code)]
+struct Analysis;
+#[cfg(not(feature = "bpm"))]
+impl Analysis {
+    fn latest_bpm(&self) -> Option<f32> {
+        None
+    }
+}
+
 /// Anzeigename eines Geräts.
 fn device_name(d: &rodio::cpal::Device) -> Option<String> {
     d.description().ok().map(|d| d.name().to_string())
@@ -220,7 +234,7 @@ pub struct Audio {
     current: Option<PathBuf>,
     /// BPM der gespielten Titel analysieren (Einstellung) + Analyse des laufenden Titels
     analyze_bpm: bool,
-    analysis: Option<crate::bpm::Analysis>,
+    analysis: Option<Analysis>,
     /// Fehlertext, wenn beim Start kein Ausgabegerät nutzbar war (einmal abholbar)
     startup_error: Option<String>,
 }
@@ -369,7 +383,17 @@ impl Audio {
         Ok(())
     }
 
+    /// Ohne das Feature `bpm`: Quelle unverändert anhängen.
+    #[cfg(not(feature = "bpm"))]
+    fn append_source<S>(&mut self, sink: &Player, source: S, _label: String)
+    where
+        S: Source + Send + 'static,
+    {
+        sink.append(source);
+    }
+
     /// Hängt die Quelle an; ist die BPM-Analyse an, läuft sie über einen Tap mit.
+    #[cfg(feature = "bpm")]
     fn append_source<S>(&mut self, sink: &Player, source: S, label: String)
     where
         S: Source + Send + 'static,
@@ -940,5 +964,28 @@ mod tests {
             assert!(!crate::db::AUDIO_EXTENSIONS.contains(&ext), "{ext}");
         }
         assert!(!is_ogg_opus(Path::new("/gibt/es/nicht.ogg")));
+    }
+
+    /// Ohne das Feature `bpm` bleibt die Wiedergabe unverändert: Einschalten der Analyse ist
+    /// ein Nichts-Tun, es gibt nie einen BPM-Wert.
+    #[cfg(not(feature = "bpm"))]
+    #[test]
+    fn ohne_feature_bpm_keine_analyse() {
+        let dir = temp("nobpm");
+        let Some(file) = silent_file(&dir, "mp3", "libmp3lame", 44100, 3) else {
+            eprintln!("ffmpeg nicht installiert – übersprungen");
+            return;
+        };
+        let Some(mut audio) = audio_or_skip() else {
+            return;
+        };
+        audio.set_volume(0.0);
+        audio.set_analyze_bpm(true);
+        audio.play(&file).unwrap();
+        assert!(audio.is_playing());
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(audio.current_bpm(), None);
+        audio.stop();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
