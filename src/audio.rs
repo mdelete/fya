@@ -31,7 +31,51 @@ pub fn output_devices() -> Vec<String> {
     names
 }
 
+/// Öffnet einen Ausgabestrom auf `device`. Erst mit der Standardkonfiguration des Geräts
+/// (inkl. rodios Ausweichen auf andere Konfigurationen); scheitert schon das Ermitteln der
+/// Standardkonfiguration (z. B. ALSA-„default“ auf dem Raspberry Pi: „The requested audio
+/// device is not available“), werden alle vom Gerät gemeldeten Konfigurationen einzeln
+/// probiert.
+fn open_on_device<E>(device: &rodio::cpal::Device, on_error: E) -> Result<MixerDeviceSink>
+where
+    E: FnMut(rodio::cpal::Error) + Send + Clone + 'static,
+{
+    let name = device_name(device).unwrap_or_else(|| "?".into());
+    let first_err = match DeviceSinkBuilder::from_device(device.clone()) {
+        Ok(builder) => match builder
+            .with_error_callback(on_error.clone())
+            .open_sink_or_fallback()
+        {
+            Ok(sink) => return Ok(sink),
+            Err(e) => anyhow!("{e}"),
+        },
+        Err(e) => anyhow!("{e}"),
+    };
+    log::debug!("Ausgabegerät „{name}“: Standardkonfiguration nicht nutzbar ({first_err:#})");
+
+    // Alle gemeldeten Konfigurationen einzeln probieren
+    if let Ok(configs) = rodio::stream::supported_output_configs(device) {
+        for config in configs {
+            let opened = DeviceSinkBuilder::default()
+                .with_device(device.clone())
+                .with_supported_config(&config)
+                .with_error_callback(on_error.clone())
+                .open_stream();
+            match opened {
+                Ok(sink) => {
+                    log::debug!("Ausgabegerät „{name}“: läuft mit {config:?}");
+                    return Ok(sink);
+                }
+                Err(e) => log::debug!("Ausgabegerät „{name}“: {config:?} abgelehnt ({e})"),
+            }
+        }
+    }
+    Err(first_err.context(format!("Ausgabegerät „{name}“ lässt sich nicht öffnen")))
+}
+
 /// Öffnet einen Ausgabestrom: `Some(name)` = dieses Gerät, `None` = Systemstandard.
+/// Ist der Systemstandard nicht nutzbar, werden – wie in rodios `open_default_sink` – die
+/// übrigen Ausgabegeräte der Reihe nach probiert; das erste funktionierende gewinnt.
 /// Verschwindet das Gerät später (z. B. Bluetooth getrennt), meldet cpal das über den
 /// Fehler-Callback (ereignisgesteuert, ohne Nachfragen); `lost` wird dann gesetzt.
 /// Rückgabe: Strom + Name des geöffneten Geräts.
@@ -46,25 +90,65 @@ fn open_stream(
         }
     };
     let host = rodio::cpal::default_host();
-    let device = match name {
-        Some(name) => host
+
+    // Ausdrücklich gewähltes Gerät: genau dieses, ohne Ausweichen auf andere
+    if let Some(name) = name {
+        let device = host
             .output_devices()?
             .find(|d| device_name(d).as_deref() == Some(name))
-            .ok_or_else(|| anyhow!("Ausgabegerät „{name}“ nicht gefunden"))?,
-        None => host
-            .default_output_device()
-            .ok_or_else(|| anyhow!("Kein Ausgabegerät gefunden"))?,
+            .ok_or_else(|| anyhow!("Ausgabegerät „{name}“ nicht gefunden"))?;
+        let sink = open_on_device(&device, on_error)?;
+        return Ok((sink, device_name(&device)));
+    }
+
+    // Systemstandard
+    let default = host.default_output_device();
+    let first_err = match &default {
+        Some(device) => match open_on_device(device, on_error.clone()) {
+            Ok(sink) => return Ok((sink, device_name(device))),
+            Err(e) => e,
+        },
+        None => anyhow!("Kein Standard-Ausgabegerät gefunden"),
     };
-    let device_name = device_name(&device);
-    let sink = DeviceSinkBuilder::from_device(device)?
-        .with_error_callback(on_error)
-        .open_sink_or_fallback()?;
-    Ok((sink, device_name))
+    log::warn!("Systemstandard nicht nutzbar ({first_err:#}); probiere andere Ausgabegeräte");
+
+    // Ausweichen: übrige Geräte (ohne „null“-Treiber) der Reihe nach
+    let default_name = default.as_ref().and_then(device_name);
+    if let Ok(devices) = host.output_devices() {
+        for device in devices {
+            let usable = device
+                .description()
+                .map(|d| d.driver().is_some_and(|drv| drv != "null"))
+                .unwrap_or(false);
+            let name = device_name(&device);
+            if !usable || name == default_name {
+                continue;
+            }
+            match open_on_device(&device, on_error.clone()) {
+                Ok(sink) => {
+                    log::warn!(
+                        "Ausgabe läuft auf „{}“ statt auf dem Systemstandard",
+                        name.as_deref().unwrap_or("?")
+                    );
+                    return Ok((sink, name));
+                }
+                Err(e) => log::debug!("Ausgabegerät {name:?} nicht nutzbar ({e:#})"),
+            }
+        }
+    }
+    Err(first_err.context("Kein Ausgabegerät nutzbar"))
+}
+
+/// Geöffneter Ausgabestrom samt Player.
+struct Output {
+    stream: MixerDeviceSink,
+    sink: Player,
 }
 
 pub struct Audio {
-    stream: MixerDeviceSink,
-    sink: Player,
+    /// None, wenn kein Ausgabegerät geöffnet werden konnte: Die App startet trotzdem
+    /// und man kann im Player ein Gerät wählen.
+    out: Option<Output>,
     volume: f32,
     /// true, solange ein Titel geladen ist (spielend oder pausiert)
     active: bool,
@@ -77,18 +161,29 @@ pub struct Audio {
     /// BPM der gespielten Titel analysieren (Einstellung) + Analyse des laufenden Titels
     analyze_bpm: bool,
     analysis: Option<crate::bpm::Analysis>,
+    /// Fehlertext, wenn beim Start kein Ausgabegerät nutzbar war (einmal abholbar)
+    startup_error: Option<String>,
 }
 
 impl Audio {
-    /// Öffnet beim Start den Systemstandard. Danach wird nur noch auf ausdrücklich
-    /// gewählte Geräte gewechselt (siehe [`Audio::set_device`]).
-    pub fn new() -> Result<Self> {
+    /// Öffnet beim Start den Systemstandard (bei Problemen ein anderes Gerät, siehe
+    /// [`open_stream`]). Danach wird nur noch auf ausdrücklich gewählte Geräte gewechselt
+    /// (siehe [`Audio::set_device`]). Findet sich gar kein Gerät, läuft die App ohne Ton
+    /// weiter (statt zu beenden): [`Audio::take_startup_error`] nennt den Grund.
+    pub fn new() -> Self {
         let lost = Arc::new(AtomicBool::new(false));
-        let (stream, device) = open_stream(None, &lost)?;
-        let sink = Player::connect_new(stream.mixer());
-        Ok(Self {
-            stream,
-            sink,
+        let (out, device, startup_error) = match open_stream(None, &lost) {
+            Ok((stream, device)) => {
+                let sink = Player::connect_new(stream.mixer());
+                (Some(Output { stream, sink }), device, None)
+            }
+            Err(e) => {
+                log::error!("Kein Ausgabegerät nutzbar: {e:#}");
+                (None, None, Some(format!("Kein Ausgabegerät nutzbar: {e:#}")))
+            }
+        };
+        Self {
+            out,
             volume: 0.8,
             active: false,
             device,
@@ -96,7 +191,17 @@ impl Audio {
             current: None,
             analyze_bpm: false,
             analysis: None,
-        })
+            startup_error,
+        }
+    }
+
+    /// Grund, warum beim Start kein Ausgabegerät geöffnet werden konnte (einmalig).
+    pub fn take_startup_error(&mut self) -> Option<String> {
+        self.startup_error.take()
+    }
+
+    fn sink(&self) -> Option<&Player> {
+        self.out.as_ref().map(|o| &o.sink)
     }
 
     /// Name des Geräts, auf dem gerade ausgegeben wird.
@@ -109,28 +214,33 @@ impl Audio {
     /// im selben Pausenzustand fortgesetzt. Bei einem Fehler bleibt der bisherige
     /// Strom aktiv.
     pub fn set_device(&mut self, name: Option<&str>) -> Result<()> {
-        let resume = match (&self.current, self.active) {
-            (Some(path), true) => Some((path.clone(), self.sink.get_pos(), self.sink.is_paused())),
+        let resume = match (&self.current, self.active, self.sink()) {
+            (Some(path), true, Some(sink)) => {
+                Some((path.clone(), sink.get_pos(), sink.is_paused()))
+            }
             _ => None,
         };
         let lost = Arc::new(AtomicBool::new(false));
         let (stream, device) = open_stream(name, &lost)?; // scheitert -> nichts verändert
 
-        let old_stream = std::mem::replace(&mut self.stream, stream);
-        self.sink = Player::connect_new(self.stream.mixer()); // stoppt den alten Sink
-        self.sink.set_volume(self.volume);
-        drop(old_stream);
+        let sink = Player::connect_new(stream.mixer());
+        sink.set_volume(self.volume);
+        // alter Strom und Sink werden hier ersetzt (stoppt die alte Wiedergabe)
+        self.out = Some(Output { stream, sink });
         self.device = device;
         self.lost = lost;
+        self.startup_error = None;
 
         if let Some((path, pos, paused)) = resume {
             if let Err(e) = self.play(&path) {
                 self.active = false;
                 return Err(e);
             }
-            let _ = self.sink.try_seek(pos);
-            if paused {
-                self.sink.pause();
+            if let Some(sink) = self.sink() {
+                let _ = sink.try_seek(pos);
+                if paused {
+                    sink.pause();
+                }
             }
         }
         Ok(())
@@ -146,12 +256,17 @@ impl Audio {
     /// (Position bleibt erhalten, es läuft nichts von allein weiter).
     pub fn recover_from_lost_device(&mut self) -> Result<()> {
         if self.active {
-            self.sink.pause();
+            if let Some(sink) = self.sink() {
+                sink.pause();
+            }
         }
         self.set_device(None)
     }
 
     pub fn play(&mut self, path: &Path) -> Result<()> {
+        let Some(out) = &self.out else {
+            bail!("Kein Ausgabegerät verfügbar – bitte im Player (Lautsprecher-Knopf) eines wählen");
+        };
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -159,7 +274,7 @@ impl Audio {
             .to_lowercase();
 
         // Neuen Sink anlegen; der alte wird beim Ersetzen gestoppt.
-        let sink = Player::connect_new(self.stream.mixer());
+        let sink = Player::connect_new(out.stream.mixer());
         sink.set_volume(self.volume);
         // Analyse des vorigen Titels beenden (der Thread endet, sobald sein Tap weg ist)
         self.analysis = None;
@@ -171,7 +286,9 @@ impl Audio {
             "opus" => self.append_source(&sink, OpusSource::open(path)?, label),
             _ => self.append_source(&sink, Decoder::try_from(File::open(path)?)?, label),
         }
-        self.sink = sink;
+        if let Some(out) = &mut self.out {
+            out.sink = sink;
+        }
         self.active = true;
         self.current = Some(path.to_path_buf());
         Ok(())
@@ -213,15 +330,19 @@ impl Audio {
         if !self.active {
             return;
         }
-        if self.sink.is_paused() {
-            self.sink.play();
-        } else {
-            self.sink.pause();
+        if let Some(sink) = self.sink() {
+            if sink.is_paused() {
+                sink.play();
+            } else {
+                sink.pause();
+            }
         }
     }
 
     pub fn stop(&mut self) {
-        self.sink.stop();
+        if let Some(sink) = self.sink() {
+            sink.stop();
+        }
         self.active = false;
     }
 
@@ -230,12 +351,12 @@ impl Audio {
     }
 
     pub fn is_playing(&self) -> bool {
-        self.active && !self.sink.is_paused()
+        self.active && self.sink().is_some_and(|s| !s.is_paused())
     }
 
     /// true, wenn der aktuelle Titel zu Ende gespielt wurde (einmalig).
     pub fn take_finished(&mut self) -> bool {
-        if self.active && self.sink.empty() {
+        if self.active && self.sink().is_some_and(|s| s.empty()) {
             self.active = false;
             true
         } else {
@@ -244,19 +365,17 @@ impl Audio {
     }
 
     pub fn position(&self) -> Duration {
-        if self.active {
-            self.sink.get_pos()
-        } else {
-            Duration::ZERO
+        match (self.active, self.sink()) {
+            (true, Some(sink)) => sink.get_pos(),
+            _ => Duration::ZERO,
         }
     }
 
     pub fn seek(&mut self, pos: Duration) -> Result<()> {
-        if !self.active {
+        let (true, Some(sink)) = (self.active, self.sink()) else {
             return Ok(());
-        }
-        self.sink
-            .try_seek(pos)
+        };
+        sink.try_seek(pos)
             .map_err(|e| anyhow::anyhow!("Spulen nicht möglich: {e:?}"))
     }
 
@@ -266,7 +385,9 @@ impl Audio {
 
     pub fn set_volume(&mut self, v: f32) {
         self.volume = v.clamp(0.0, 1.0);
-        self.sink.set_volume(self.volume);
+        if let Some(sink) = self.sink() {
+            sink.set_volume(self.volume);
+        }
     }
 }
 
@@ -441,6 +562,16 @@ mod tests {
         Some(file)
     }
 
+    /// Player auf dem Systemstandard; None (Test überspringen), wenn kein Gerät da ist (CI).
+    fn audio_or_skip() -> Option<Audio> {
+        let audio = Audio::new();
+        if audio.device().is_none() {
+            eprintln!("kein Ausgabegerät – übersprungen");
+            return None;
+        }
+        Some(audio)
+    }
+
     fn temp(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("fya-audio-test-{}-{name}", std::process::id()));
@@ -463,8 +594,7 @@ mod tests {
     /// Start auf dem Systemstandard; danach nur ausdrücklich gewählte Geräte.
     #[test]
     fn start_standard_dann_explizit() {
-        let Ok(mut audio) = Audio::new() else {
-            eprintln!("kein Ausgabegerät – übersprungen");
+        let Some(mut audio) = audio_or_skip() else {
             return;
         };
         let start = audio.device().map(str::to_string);
@@ -498,8 +628,7 @@ mod tests {
             eprintln!("ffmpeg nicht installiert – übersprungen");
             return;
         };
-        let Ok(mut audio) = Audio::new() else {
-            eprintln!("kein Ausgabegerät – übersprungen");
+        let Some(mut audio) = audio_or_skip() else {
             return;
         };
         audio.set_volume(0.5);
@@ -537,8 +666,7 @@ mod tests {
             eprintln!("ffmpeg nicht installiert – übersprungen");
             return;
         };
-        let Ok(mut audio) = Audio::new() else {
-            eprintln!("kein Ausgabegerät – übersprungen");
+        let Some(mut audio) = audio_or_skip() else {
             return;
         };
         let default_dev = audio.device().map(str::to_string);
@@ -570,8 +698,7 @@ mod tests {
     /// Wiedergabe + Spulen für MP3, Opus und AAC.
     #[test]
     fn abspielen_und_spulen_mp3_opus_aac() {
-        let Ok(mut audio) = Audio::new() else {
-            eprintln!("kein Ausgabegerät – übersprungen");
+        let Some(mut audio) = audio_or_skip() else {
             return;
         };
         let dir = temp("play");
@@ -595,5 +722,42 @@ mod tests {
             audio.stop();
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Ohne Ausgabegerät (z. B. Raspberry Pi, wo der Systemstandard nicht öffnet) darf die
+    /// App nicht abstürzen: alle Funktionen sind harmlos, `play` meldet einen klaren Fehler,
+    /// und das Wählen eines Geräts stellt die Wiedergabe wieder her.
+    #[test]
+    fn ohne_ausgabegeraet_laeuft_die_app_weiter() {
+        let mut audio = Audio {
+            out: None,
+            volume: 0.8,
+            active: false,
+            device: None,
+            lost: Arc::new(AtomicBool::new(false)),
+            current: None,
+            analyze_bpm: false,
+            analysis: None,
+            startup_error: Some("Kein Ausgabegerät nutzbar: Test".into()),
+        };
+        assert_eq!(audio.take_startup_error().as_deref(), Some("Kein Ausgabegerät nutzbar: Test"));
+        assert_eq!(audio.take_startup_error(), None, "einmalig");
+
+        let err = audio.play(Path::new("/gibt/es/nicht.mp3")).unwrap_err();
+        assert!(err.to_string().contains("Kein Ausgabegerät"), "{err}");
+        audio.toggle_pause();
+        audio.stop();
+        audio.set_volume(0.3);
+        assert!(!audio.is_active() && !audio.is_playing() && !audio.take_finished());
+        assert_eq!(audio.position(), Duration::ZERO);
+        audio.seek(Duration::from_secs(1)).unwrap();
+        assert!((audio.volume() - 0.3).abs() < 1e-6);
+
+        // Gerät wählen (Systemstandard) stellt den Betrieb her, sofern ein Gerät existiert
+        if audio.set_device(None).is_ok() {
+            assert!(audio.device().is_some());
+            assert!(audio.out.is_some());
+            assert!((audio.volume() - 0.3).abs() < 1e-6);
+        }
     }
 }

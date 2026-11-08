@@ -73,7 +73,7 @@ fn main() -> anyhow::Result<()> {
     let library = Library::open(&db_path)?;
     // Beim Start läuft die Ausgabe auf dem Systemstandard; danach wird nur noch auf
     // ausdrücklich gewählte Geräte gewechselt.
-    let audio = Audio::new()?;
+    let audio = Audio::new();
 
     // iced ruft die Boot-Funktion genau einmal auf; so reichen wir die
     // bereits erzeugten Objekte hinein.
@@ -522,7 +522,9 @@ struct PlayerApp {
 }
 
 impl PlayerApp {
-    fn new(library: Library, audio: Audio, db_path: PathBuf) -> (Self, Task<Message>) {
+    fn new(library: Library, mut audio: Audio, db_path: PathBuf) -> (Self, Task<Message>) {
+        // Kein Ausgabegerät nutzbar: App startet trotzdem, die Statuszeile nennt den Grund
+        let startup_error = audio.take_startup_error();
         let mut app = Self {
             library,
             db_path,
@@ -601,6 +603,7 @@ impl PlayerApp {
             }
         }
         set_colors(&app.theme);
+        app.status = startup_error;
         app.mixtape_convert = app.library.setting("mixtape_convert").as_deref() == Some("1");
         if let Some(f) = app
             .library

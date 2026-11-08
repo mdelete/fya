@@ -258,10 +258,11 @@ mod tests {
             eprintln!("ffmpeg nicht installiert – übersprungen");
             return;
         };
-        let Ok(mut audio) = crate::audio::Audio::new() else {
+        let mut audio = crate::audio::Audio::new();
+        if audio.device().is_none() {
             eprintln!("kein Ausgabegerät – übersprungen");
             return;
-        };
+        }
         let dir = std::env::temp_dir().join(format!("fya-bpm-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
