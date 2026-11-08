@@ -17,18 +17,41 @@ fn device_name(d: &rodio::cpal::Device) -> Option<String> {
     d.description().ok().map(|d| d.name().to_string())
 }
 
-/// Namen aller Ausgabegeräte (ohne Duplikate). Treiberabfrage – nicht im UI-Thread
-/// aufrufen.
-pub fn output_devices() -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    if let Ok(devices) = rodio::cpal::default_host().output_devices() {
-        for name in devices.filter_map(|d| device_name(&d)) {
-            if !names.contains(&name) {
-                names.push(name);
+/// Audio-Hosts in der Reihenfolge, in der sie benutzt werden: zuerst der Standard-Host der
+/// Plattform, danach die übrigen verfügbaren. Unter Linux ist der Standard-Host PulseAudio
+/// (bzw. PipeWire über dessen Pulse-Schnittstelle), sobald ein solcher Server läuft; sonst ALSA.
+fn hosts() -> Vec<rodio::cpal::Host> {
+    let default = rodio::cpal::default_host();
+    let default_id = default.id();
+    let mut hosts = vec![default];
+    for id in rodio::cpal::available_hosts() {
+        if id != default_id {
+            if let Ok(host) = rodio::cpal::host_from_id(id) {
+                hosts.push(host);
             }
         }
     }
-    names
+    hosts
+}
+
+/// Namen aller Ausgabegeräte (ohne Duplikate) des ersten Hosts, der welche hat – unter
+/// Linux also die Geräte, die auch ein Desktop-Mixer kennt (HDMI, Bluetooth-Lautsprecher …)
+/// statt roher ALSA-Einträge. Treiberabfrage – nicht im UI-Thread aufrufen.
+pub fn output_devices() -> Vec<String> {
+    for host in hosts() {
+        let mut names: Vec<String> = Vec::new();
+        if let Ok(devices) = host.output_devices() {
+            for name in devices.filter_map(|d| device_name(&d)) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        if !names.is_empty() {
+            return names;
+        }
+    }
+    Vec::new()
 }
 
 /// Öffnet einen Ausgabestrom auf `device`. Erst mit der Standardkonfiguration des Geräts
@@ -73,35 +96,15 @@ where
     Err(first_err.context(format!("Ausgabegerät „{name}“ lässt sich nicht öffnen")))
 }
 
-/// Öffnet einen Ausgabestrom: `Some(name)` = dieses Gerät, `None` = Systemstandard.
-/// Ist der Systemstandard nicht nutzbar, werden – wie in rodios `open_default_sink` – die
-/// übrigen Ausgabegeräte der Reihe nach probiert; das erste funktionierende gewinnt.
-/// Verschwindet das Gerät später (z. B. Bluetooth getrennt), meldet cpal das über den
-/// Fehler-Callback (ereignisgesteuert, ohne Nachfragen); `lost` wird dann gesetzt.
-/// Rückgabe: Strom + Name des geöffneten Geräts.
-fn open_stream(
-    name: Option<&str>,
-    lost: &Arc<AtomicBool>,
-) -> Result<(MixerDeviceSink, Option<String>)> {
-    let flag = lost.clone();
-    let on_error = move |e: rodio::cpal::Error| {
-        if e.kind() == rodio::cpal::ErrorKind::DeviceNotAvailable {
-            flag.store(true, Ordering::Relaxed);
-        }
-    };
-    let host = rodio::cpal::default_host();
-
-    // Ausdrücklich gewähltes Gerät: genau dieses, ohne Ausweichen auf andere
-    if let Some(name) = name {
-        let device = host
-            .output_devices()?
-            .find(|d| device_name(d).as_deref() == Some(name))
-            .ok_or_else(|| anyhow!("Ausgabegerät „{name}“ nicht gefunden"))?;
-        let sink = open_on_device(&device, on_error)?;
-        return Ok((sink, device_name(&device)));
-    }
-
-    // Systemstandard
+/// Systemstandard eines Hosts; ist er nicht nutzbar, werden – wie in rodios
+/// `open_default_sink` – die übrigen Geräte des Hosts der Reihe nach probiert.
+fn open_default_on_host<E>(
+    host: &rodio::cpal::Host,
+    on_error: &E,
+) -> Result<(MixerDeviceSink, Option<String>)>
+where
+    E: FnMut(rodio::cpal::Error) + Send + Clone + 'static,
+{
     let default = host.default_output_device();
     let first_err = match &default {
         Some(device) => match open_on_device(device, on_error.clone()) {
@@ -110,7 +113,10 @@ fn open_stream(
         },
         None => anyhow!("Kein Standard-Ausgabegerät gefunden"),
     };
-    log::warn!("Systemstandard nicht nutzbar ({first_err:#}); probiere andere Ausgabegeräte");
+    log::warn!(
+        "{}: Systemstandard nicht nutzbar ({first_err:#}); probiere andere Ausgabegeräte",
+        host.id().name()
+    );
 
     // Ausweichen: übrige Geräte (ohne „null“-Treiber) der Reihe nach
     let default_name = default.as_ref().and_then(device_name);
@@ -118,7 +124,7 @@ fn open_stream(
         for device in devices {
             let usable = device
                 .description()
-                .map(|d| d.driver().is_some_and(|drv| drv != "null"))
+                .map(|d| d.driver().is_none_or(|drv| drv != "null"))
                 .unwrap_or(false);
             let name = device_name(&device);
             if !usable || name == default_name {
@@ -136,7 +142,61 @@ fn open_stream(
             }
         }
     }
-    Err(first_err.context("Kein Ausgabegerät nutzbar"))
+    Err(first_err)
+}
+
+/// Öffnet einen Ausgabestrom: `Some(name)` = dieses Gerät, `None` = Systemstandard.
+/// Probiert die Hosts der Reihe nach (siehe [`hosts`]): Läuft der Standard-Host nicht, fällt
+/// der Systemstandard auf den nächsten zurück. Ein ausdrücklich gewähltes Gerät wird nur
+/// genau so geöffnet, ohne Ausweichen auf andere Geräte.
+/// Verschwindet das Gerät später (z. B. Bluetooth getrennt), meldet cpal das über den
+/// Fehler-Callback (ereignisgesteuert, ohne Nachfragen); `lost` wird dann gesetzt.
+/// Rückgabe: Strom + Name des geöffneten Geräts.
+fn open_stream(
+    name: Option<&str>,
+    lost: &Arc<AtomicBool>,
+) -> Result<(MixerDeviceSink, Option<String>)> {
+    let flag = lost.clone();
+    let on_error = move |e: rodio::cpal::Error| {
+        if e.kind() == rodio::cpal::ErrorKind::DeviceNotAvailable {
+            flag.store(true, Ordering::Relaxed);
+        }
+    };
+
+    // Ausdrücklich gewähltes Gerät: genau dieses (im ersten Host, der es kennt)
+    if let Some(name) = name {
+        for host in hosts() {
+            let Ok(devices) = host.output_devices() else {
+                continue;
+            };
+            if let Some(device) = devices
+                .into_iter()
+                .find(|d| device_name(d).as_deref() == Some(name))
+            {
+                let sink = open_on_device(&device, on_error)?;
+                return Ok((sink, device_name(&device)));
+            }
+        }
+        bail!("Ausgabegerät „{name}“ nicht gefunden");
+    }
+
+    // Systemstandard: Host für Host
+    let mut first_err = None;
+    for host in hosts() {
+        match open_default_on_host(&host, &on_error) {
+            Ok(opened) => {
+                log::debug!("Audio-Host: {}", host.id().name());
+                return Ok(opened);
+            }
+            Err(e) => {
+                log::warn!("Audio-Host {} nicht nutzbar: {e:#}", host.id().name());
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    Err(first_err
+        .unwrap_or_else(|| anyhow!("Kein Ausgabegerät gefunden"))
+        .context("Kein Ausgabegerät nutzbar"))
 }
 
 /// Geöffneter Ausgabestrom samt Player.
@@ -214,6 +274,15 @@ impl Audio {
     /// im selben Pausenzustand fortgesetzt. Bei einem Fehler bleibt der bisherige
     /// Strom aktiv.
     pub fn set_device(&mut self, name: Option<&str>) -> Result<()> {
+        // Läuft schon auf diesem Gerät: nichts tun (ALSA-Geräte lassen sich nicht doppelt öffnen)
+        if let Some(name) = name {
+            if self.out.is_some()
+                && self.device.as_deref() == Some(name)
+                && !self.lost.load(Ordering::Relaxed)
+            {
+                return Ok(());
+            }
+        }
         let resume = match (&self.current, self.active, self.sink()) {
             (Some(path), true, Some(sink)) => {
                 Some((path.clone(), sink.get_pos(), sink.is_paused()))
@@ -759,5 +828,33 @@ mod tests {
             assert!(audio.out.is_some());
             assert!((audio.volume() - 0.3).abs() < 1e-6);
         }
+    }
+
+    /// Der erste Host ist der Standard-Host der Plattform; es gibt mindestens einen.
+    #[test]
+    fn hosts_standard_host_zuerst() {
+        let hosts = hosts();
+        assert!(!hosts.is_empty());
+        assert_eq!(hosts[0].id(), rodio::cpal::default_host().id());
+        let ids: Vec<_> = hosts.iter().map(|h| h.id()).collect();
+        let mut unique = ids.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "Hosts doppelt: {ids:?}");
+    }
+
+    /// Dasselbe Gerät noch einmal zu wählen ändert nichts (und scheitert nicht an exklusiv
+    /// geöffneten ALSA-Geräten).
+    #[test]
+    fn gleiches_geraet_waehlen_ist_ein_noop() {
+        let Some(mut audio) = audio_or_skip() else {
+            return;
+        };
+        let name = audio.device().unwrap().to_string();
+        audio.set_device(Some(&name)).unwrap();
+        assert_eq!(audio.device(), Some(name.as_str()));
+        // nach „Gerät verschwunden“ wird dagegen wirklich neu geöffnet
+        audio.lost.store(true, Ordering::Relaxed);
+        let _ = audio.set_device(Some(&name));
+        assert!(!audio.take_device_lost(), "Flag gehört zum alten Strom und ist weg");
     }
 }
