@@ -9,8 +9,13 @@ use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt};
 
-/// Dateiendungen, die als Song erkannt werden (`m4a` = AAC im MP4-Container).
-pub const AUDIO_EXTENSIONS: &[&str] = &["mp3", "aac", "m4a", "opus"];
+/// Dateiendungen, die als Song erkannt werden (`m4a` = AAC im MP4-Container). Mit dem
+/// Cargo-Feature `ogg` zusätzlich Ogg (Vorbis, FLAC, Opus) und natives FLAC.
+pub const AUDIO_EXTENSIONS: &[&str] = if cfg!(feature = "ogg") {
+    &["mp3", "aac", "m4a", "opus", "ogg", "oga", "flac"]
+} else {
+    &["mp3", "aac", "m4a", "opus"]
+};
 
 #[derive(Clone, Debug)]
 pub struct Artist {
@@ -698,7 +703,7 @@ struct Meta {
 
 /// Liest Tags (ID3v2, ID3v1, MP4-Atome, Vorbis-Comments/OpusTags) und Dauer.
 fn read_meta(path: &Path) -> Meta {
-    let tagged = match lofty::read_from_path(path) {
+    let tagged = match open_tagged(path) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("    Warnung: {} nicht lesbar ({e})", path.display());
@@ -774,7 +779,7 @@ fn fill_tags_from_filename(path: &Path, meta: &mut Meta) {
 /// Tag-Container an, falls die Datei noch keinen hat. Bestehende andere Tags
 /// bleiben erhalten.
 pub fn write_tags(path: &Path, artist: &str, album: Option<&str>, title: &str) -> Result<()> {
-    let mut tagged = lofty::read_from_path(path)?;
+    let mut tagged = open_tagged(path)?;
     if tagged.primary_tag().is_none() && tagged.first_tag().is_none() {
         let tag_type = tagged.primary_tag_type();
         tagged.insert_tag(Tag::new(tag_type));
@@ -796,13 +801,21 @@ pub fn write_tags(path: &Path, artist: &str, album: Option<&str>, title: &str) -
 /// Frontcover, sonst das erste Bild. Rohbytes (JPEG/PNG …).
 pub fn read_cover(path: &Path) -> Option<Vec<u8>> {
     use lofty::picture::PictureType;
-    let tagged = lofty::read_from_path(path).ok()?;
+    let tagged = open_tagged(path).ok()?;
     let pictures: Vec<_> = tagged.tags().iter().flat_map(|t| t.pictures()).collect();
     pictures
         .iter()
         .find(|p| p.pic_type() == PictureType::CoverFront)
         .or_else(|| pictures.first())
         .map(|p| p.data().to_vec())
+}
+
+/// Öffnet eine Datei zum Lesen/Schreiben der Tags. Anders als `lofty::read_from_path`, das
+/// nur nach der Endung entscheidet (`.ogg` wäre immer Vorbis, `.oga` unbekannt), wird der
+/// Dateityp zuerst am Inhalt erkannt; die Endung dient nur als Rückfall. So lassen sich auch
+/// Opus-Dateien mit der Endung `.ogg` lesen. (Ogg-FLAC kann `lofty` nicht – siehe README.)
+fn open_tagged(path: &Path) -> Result<lofty::file::TaggedFile> {
+    Ok(lofty::probe::Probe::open(path)?.guess_file_type()?.read()?)
 }
 
 fn text_item(tag: &lofty::tag::Tag, key: ItemKey) -> Option<String> {
@@ -1207,7 +1220,7 @@ fn parse_num(label: &str, s: &str) -> Result<Option<u32>> {
 
 /// Liest die Tags der Datei für den Editor.
 pub fn read_tag_edit(path: &Path) -> Result<TagEdit> {
-    let tagged = lofty::read_from_path(path)?;
+    let tagged = open_tagged(path)?;
     let mut e = TagEdit::default();
     if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
         let s = |v: Option<std::borrow::Cow<'_, str>>| clean_text(v).unwrap_or_default();
@@ -1261,7 +1274,7 @@ impl TagEdit {
 /// den jeweiligen Eintrag. Andere Tags (Cover usw.) bleiben erhalten.
 pub fn write_tag_edit(path: &Path, e: &TagEdit) -> Result<()> {
     e.validate()?;
-    let mut tagged = lofty::read_from_path(path)?;
+    let mut tagged = open_tagged(path)?;
     if tagged.primary_tag().is_none() && tagged.first_tag().is_none() {
         let tag_type = tagged.primary_tag_type();
         tagged.insert_tag(Tag::new(tag_type));
@@ -1944,6 +1957,77 @@ mod trim_tests {
             (e.title.as_str(), e.artist.as_str(), e.album.as_str()),
             ("Try Again", "Aaliyah", "Romeo Must Die Soundtrack")
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(all(test, feature = "ogg"))]
+mod ogg_tests {
+    use super::*;
+
+    /// Feature `ogg`: Scan nimmt .ogg (Vorbis), .oga (FLAC in Ogg), .flac und .ogg mit Opus
+    /// auf; Tags (Titel, BPM) werden gelesen und im Tag-Editor angezeigt. Braucht ffmpeg.
+    #[test]
+    fn scan_erkennt_ogg_und_flac_mit_tags() {
+        let Some(ffmpeg) = crate::mixtape::find_ffmpeg() else {
+            eprintln!("ffmpeg nicht installiert – übersprungen");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("fya-ogg-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let album = dir.join("musik/Künstler/Album");
+        std::fs::create_dir_all(&album).unwrap();
+        for (name, args) in [
+            ("a.ogg", &["-c:a", "vorbis", "-strict", "-2", "-f", "ogg"][..]),
+            ("b.oga", &["-c:a", "flac", "-f", "ogg"][..]),
+            ("c.flac", &["-c:a", "flac"][..]),
+            ("d.ogg", &["-c:a", "libopus", "-f", "ogg"][..]),
+        ] {
+            let ok = std::process::Command::new(&ffmpeg)
+                .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1"])
+                .args(["-metadata", &format!("title=T-{name}"), "-metadata", "BPM=128"])
+                .args(args)
+                .arg(album.join(name))
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{name}: ffmpeg");
+        }
+        let db = dir.join("library.db");
+        Library::open(&db).unwrap();
+        assert_eq!(rebuild_from(&db, &dir.join("musik")).unwrap(), 4, "alle vier aufgenommen");
+
+        let lib = Library::open(&db).unwrap();
+        let rows: Vec<(String, Option<i64>)> = lib
+            .conn
+            .prepare("SELECT title, bpm FROM tracks ORDER BY path")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        // lofty liest keine Ogg-FLAC-Tags: b.oga wird aufgenommen und ist abspielbar, hat aber
+        // keine Tags (Titel = Dateiname). Alle anderen werden gelesen, auch Opus in einer .ogg
+        // (Erkennung am Inhalt statt an der Endung).
+        let expect: Vec<(String, Option<i64>)> = vec![
+            ("T-a.ogg".into(), Some(128)),
+            ("b".into(), None),
+            ("T-c.flac".into(), Some(128)),
+            ("T-d.ogg".into(), Some(128)),
+        ];
+        assert_eq!(rows, expect);
+
+        // Tag-Editor: Lesen und Schreiben für Vorbis, natives FLAC und Opus in .ogg
+        for name in ["a.ogg", "c.flac", "d.ogg"] {
+            let file = album.join(name);
+            let mut e = read_tag_edit(&file).unwrap();
+            assert_eq!((e.title.as_str(), e.bpm.as_str()), (format!("T-{name}").as_str(), "128"), "{name}");
+            e.title = format!("Neu-{name}");
+            e.bpm = "97".into();
+            write_tag_edit(&file, &e).unwrap_or_else(|err| panic!("{name}: schreiben: {err:#}"));
+            let back = read_tag_edit(&file).unwrap();
+            assert_eq!((back.title.as_str(), back.bpm.as_str()), (format!("Neu-{name}").as_str(), "97"), "{name}");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

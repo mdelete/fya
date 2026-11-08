@@ -64,6 +64,23 @@ Konsolenfenster). Daten liegen unter `%APPDATA%\fya\`. Die CI (`.github/workflow
 die .exe aber auch auf Anfrage über Actions. Beim Cross-Kompilieren von macOS/Linux
 (`--target x86_64-pc-windows-gnu`, benötigt mingw-w64 (brew install mingw-w64)) wird das Icon nicht eingebettet.
 
+## Optional: Ogg und FLAC (`--features ogg`)
+Standardmäßig spielt FYA `mp3`, `aac`, `m4a` und `opus`. Mit dem Cargo-Feature `ogg` kommen
+`ogg`/`oga` (Vorbis, FLAC in Ogg, Opus in Ogg) und natives `flac` dazu:
+
+```
+cargo build --release --features ogg
+```
+
+- Vorbis und FLAC decodiert symphonia (über rodio); `.ogg`-Dateien mit Opus-Inhalt erkennt die
+  App am Inhalt und spielt sie mit dem eigenen Opus-Decoder.
+- **Ogg-FLAC** (FLAC im Ogg-Container, meist `.oga`) lässt sich abspielen, aber `lofty` kann
+  seine Tags nicht lesen: Titel ist dann der Dateiname, es gibt keine Tags und keine Laufzeit.
+- **Speex** wird nicht unterstützt (kein Decoder); die Datei erscheint in der Bibliothek, beim
+  Abspielen meldet die Statuszeile einen Fehler.
+- Ohne das Feature werden diese Endungen beim Einlesen ignoriert. Nach dem Aktivieren die
+  Bibliothek über „Neu einlesen“ aktualisieren.
+
 ## Bedienung
 Ordner wählen → Künstler → Album → Titel anklicken. Leertaste = Play/Pause,
 Slider unten = Spulen und Lautstärke.

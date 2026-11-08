@@ -351,9 +351,15 @@ impl Audio {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        match ext.as_str() {
-            "opus" => self.append_source(&sink, OpusSource::open(path)?, label),
-            _ => self.append_source(&sink, Decoder::try_from(File::open(path)?)?, label),
+        // Opus (eigener Decoder). Eine .ogg/.oga kann Vorbis, FLAC oder Opus enthalten; symphonia
+        // kann Opus nicht decodieren, daher die Weiche am Inhalt. Alles andere erkennt der
+        // Standard-Decoder selbst (Feature `ogg`: Vorbis, FLAC; Speex wird nie unterstützt).
+        let is_opus = ext == "opus"
+            || (cfg!(feature = "ogg") && matches!(ext.as_str(), "ogg" | "oga") && is_ogg_opus(path));
+        if is_opus {
+            self.append_source(&sink, OpusSource::open(path)?, label);
+        } else {
+            self.append_source(&sink, Decoder::try_from(File::open(path)?)?, label);
         }
         if let Some(out) = &mut self.out {
             out.sink = sink;
@@ -458,6 +464,18 @@ impl Audio {
             sink.set_volume(self.volume);
         }
     }
+}
+
+/// Enthält die Ogg-Datei einen Opus-Stream? (Der Kopf `OpusHead` steht im ersten Paket,
+/// also in den ersten Bytes der ersten Seite.)
+fn is_ogg_opus(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 128];
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let n = file.read(&mut head).unwrap_or(0);
+    head[..n].starts_with(b"OggS") && head[..n].windows(8).any(|w| w == b"OpusHead")
 }
 
 // ---------------------------------------------------------------------------
@@ -856,5 +874,71 @@ mod tests {
         audio.lost.store(true, Ordering::Relaxed);
         let _ = audio.set_device(Some(&name));
         assert!(!audio.take_device_lost(), "Flag gehört zum alten Strom und ist weg");
+    }
+
+    /// Ogg-/FLAC-Dateien erzeugen (ffmpeg): (Dateiname, ffmpeg-Argumente).
+    #[cfg(feature = "ogg")]
+    fn ogg_samples(dir: &Path, ffmpeg: &Path) -> Vec<PathBuf> {
+        let cases: [(&str, &[&str]); 4] = [
+            ("vorbis.ogg", &["-c:a", "vorbis", "-strict", "-2", "-f", "ogg"]),
+            ("flac_in_ogg.oga", &["-c:a", "flac", "-f", "ogg"]),
+            ("native.flac", &["-c:a", "flac"]),
+            ("opus_in.ogg", &["-c:a", "libopus", "-f", "ogg"]), // .ogg mit Opus-Inhalt
+        ];
+        cases
+            .iter()
+            .map(|(name, args)| {
+                let file = dir.join(name);
+                let ok = std::process::Command::new(ffmpeg)
+                    .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "6"])
+                    .args(*args)
+                    .arg(&file)
+                    .status()
+                    .unwrap()
+                    .success();
+                assert!(ok, "{name}: ffmpeg");
+                file
+            })
+            .collect()
+    }
+
+    /// Feature `ogg`: Vorbis, FLAC in Ogg, natives FLAC und Opus in einer .ogg lassen sich
+    /// abspielen und spulen (Opus über die Weiche zum eigenen Decoder).
+    #[cfg(feature = "ogg")]
+    #[test]
+    fn ogg_vorbis_flac_und_opus_weiche() {
+        let Some(ffmpeg) = crate::mixtape::find_ffmpeg() else {
+            eprintln!("ffmpeg nicht installiert – übersprungen");
+            return;
+        };
+        let Some(mut audio) = audio_or_skip() else {
+            return;
+        };
+        let dir = temp("ogg");
+        for file in ogg_samples(&dir, &ffmpeg) {
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            assert_eq!(
+                is_ogg_opus(&file),
+                name.starts_with("opus_in"),
+                "{name}: Opus-Erkennung"
+            );
+            audio.play(&file).unwrap_or_else(|e| panic!("{name}: play: {e:#}"));
+            assert!(audio.is_playing(), "{name}");
+            audio.seek(Duration::from_secs(3)).unwrap_or_else(|e| panic!("{name}: seek: {e:#}"));
+            let pos = audio.position().as_secs_f32();
+            assert!((2.0..4.5).contains(&pos), "{name}: Position {pos} s nach Spulen auf 3 s");
+            audio.stop();
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Ohne das Feature `ogg` kennt die App weder Ogg noch FLAC (und `is_ogg_opus` ist harmlos).
+    #[cfg(not(feature = "ogg"))]
+    #[test]
+    fn ohne_feature_kein_ogg() {
+        for ext in ["ogg", "oga", "flac"] {
+            assert!(!crate::db::AUDIO_EXTENSIONS.contains(&ext), "{ext}");
+        }
+        assert!(!is_ogg_opus(Path::new("/gibt/es/nicht.ogg")));
     }
 }
