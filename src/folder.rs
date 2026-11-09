@@ -7,6 +7,7 @@
 //! Security-Scoped Bookmark erzeugt (-> Datenbank, Tabelle `settings`) und beim
 //! Start wieder aufgelöst. Ohne Sandbox (Linux, `cargo run`) genügt der Pfad.
 
+use rust_i18n::t;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -76,7 +77,7 @@ impl FolderAccess {
 
         // Kein (brauchbares) Bookmark: normaler Pfad (Linux, Build ohne Sandbox).
         std::fs::read_dir(stored_path)
-            .map_err(|e| anyhow!("{} ist nicht lesbar ({e})", stored_path.display()))?;
+            .map_err(|e| anyhow!(t!("folder.unreadable", path = stored_path.display(), e = e)))?;
         Ok(Restored {
             access: Self {
                 path: stored_path.to_path_buf(),
@@ -91,7 +92,7 @@ impl FolderAccess {
 /// Nativer Ordner-Dialog (macOS: NSOpenPanel, Linux: XDG Desktop Portal, Windows: IFileDialog).
 #[cfg(not(target_os = "macos"))]
 pub async fn pick_folder(start: Option<PathBuf>) -> Option<PathBuf> {
-    let mut dialog = rfd::AsyncFileDialog::new().set_title("Musikordner wählen");
+    let mut dialog = rfd::AsyncFileDialog::new().set_title(t!("folder.pick_title").as_ref());
     if let Some(dir) = start {
         dialog = dialog.set_directory(dir);
     }
@@ -120,6 +121,7 @@ pub fn is_permission_denied(err: &anyhow::Error) -> bool {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use rust_i18n::t;
     use objc2::rc::Retained;
     use objc2::runtime::Bool;
     use objc2_foundation::{
@@ -200,7 +202,7 @@ mod macos {
         panel.setCanChooseDirectories(true);
         panel.setAllowsMultipleSelection(false);
         panel.setShowsHiddenFiles(true);
-        panel.setMessage(Some(&NSString::from_str("Musikordner wählen")));
+        panel.setMessage(Some(&NSString::from_str(&t!("folder.pick_title"))));
         if let Some(dir) = start {
             let url = NSURL::fileURLWithPath(&NSString::from_str(&dir.to_string_lossy()));
             panel.setDirectoryURL(Some(&url));

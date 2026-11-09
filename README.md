@@ -100,3 +100,9 @@ Slider unten = Spulen und Lautstärke.
 ### Suche
 
 * Die Künstlerliste unter Music wird aus den Künstler-Ordnern gebaut, und „Compilations“ ist dabei bewusst ausgeblendet. Ein Künstler, der nur auf Samplern vorkommt, hat keinen Ordner und taucht in der Liste "Music" nicht auf, nur unter "Compilations" ist er zu finden.
+
+## Links
+
+* https://crates.io/crates/souvlaki
+* https://github.com/longbridge/gpui-fast
+* https://github.com/longbridge/gpui-kit

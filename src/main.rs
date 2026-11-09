@@ -6,8 +6,11 @@ mod audio;
 mod bpm;
 mod db;
 mod folder;
+mod lang;
 mod mixtape;
 mod musicbrainz;
+
+rust_i18n::i18n!("locales", fallback = "en");
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -25,6 +28,8 @@ use iced::{
     Alignment, Border, Color, Element, Event, Font, Length, Padding, Subscription, Task, Theme,
     event, keyboard, time,
 };
+
+use rust_i18n::t;
 
 use audio::Audio;
 use db::{Album, Artist, Library, MusicRoot, Playlist, SearchHits, TagEdit, Track};
@@ -72,6 +77,9 @@ fn main() -> anyhow::Result<()> {
 
     // Legt Datei + Schema an; der Scan folgt erst nach der Ordnerwahl.
     let library = Library::open(&db_path)?;
+    // Sprache vor allem anderen setzen (auch Audio::new() erzeugt Meldungen)
+    let language = lang::detect(library.setting(lang::SETTING_KEY).as_deref());
+    lang::apply(language);
     // Beim Start läuft die Ausgabe auf dem Systemstandard; danach wird nur noch auf
     // ausdrücklich gewählte Geräte gewechselt.
     let audio = Audio::new();
@@ -283,6 +291,9 @@ fn panel_style(_: &Theme) -> container::Style {
 #[derive(Debug, Clone)]
 enum Message {
     SelectArtist(i64),
+    FocusSearch,
+    /// F1–F6: Tab wechseln (wird bei offenem Dialog/Popover ignoriert)
+    ShowViewKey(View),
     /// Cover der Alben (Album-ID, Bytes) im Hintergrund geladen
     AlbumCovers(Vec<(i64, Option<Vec<u8>>)>),
     PlayTrack(usize),
@@ -303,6 +314,7 @@ enum Message {
     SelectCompAlbum(Option<i64>),
     SelectPlaylist(i64),
     ThemeSelected(Theme),
+    LanguageSelected(lang::Lang),
     /// Lautsprecher-Knopf im Player: Geräte-Popover öffnen/schließen
     ToggleDeviceMenu,
     DevicesLoaded(Vec<String>),
@@ -329,7 +341,7 @@ enum Message {
     /// Gewählter Zielpfad (None = abgebrochen)
     MixtapeTarget(i64, Option<PathBuf>),
     MixtapeDone(Result<(usize, usize, usize, PathBuf), String>),
-    /// Alt+↑ / Alt+↓: laufenden Titel in der Playlist verschieben (-1 / +1)
+    /// Alt+↑ / Alt+↓ (macOS: Option+↑ / Option+↓): laufenden Titel in der Playlist verschieben (-1 / +1)
     MovePlaylistTrack(i32),
     /// Esc: schließt den jeweils offenen Dialog
     Escape,
@@ -497,6 +509,8 @@ struct PlayerApp {
     /// Gewähltes Theme (siehe Einstellungen) und alle Optionen
     theme: Theme,
     theme_options: Vec<Theme>,
+    /// Oberflächensprache (Einstellung)
+    language: lang::Lang,
     /// Mixtapes per ffmpeg konvertieren (Einstellung), Zielformat, gefundenes ffmpeg
     mixtape_convert: bool,
     mixtape_format: mixtape::Format,
@@ -522,10 +536,135 @@ struct PlayerApp {
     status: Option<String>,
 }
 
+/// Funktionstasten: F1 / Druck = Suche, F2–F7 = Tabs (Reihenfolge der Sidebar).
+fn function_key_message(key: keyboard::key::Named) -> Option<Message> {
+    use keyboard::key::Named;
+    Some(match key {
+        Named::Select => Message::FocusSearch,
+        Named::F1 => Message::ShowViewKey(View::Music),
+        Named::F2 => Message::ShowViewKey(View::Compilations),
+        Named::F3 => Message::ShowViewKey(View::Playlists),
+        Named::F4 => Message::ShowViewKey(View::MusicBrainz),
+        Named::F5 => Message::ShowViewKey(View::Settings),
+        Named::F6 => Message::ShowViewKey(View::Help),
+        _ => return None,
+    })
+}
+
+/// Tastatur-Ereignisse -> Nachrichten. Zeichen- und Leertaste nur, wenn kein Widget (z. B.
+/// ein Textfeld) sie verbraucht hat; Funktionstasten, Esc, Tab und Alt+↑/↓ immer.
+fn map_key(event: Event, status: event::Status, _window: iced::window::Id) -> Option<Message> {
+    // Funktionstasten fängt kein Textfeld ab: unabhängig vom Status
+    if let Event::Keyboard(keyboard::Event::KeyPressed {
+        key: keyboard::Key::Named(named),
+        ..
+    }) = &event
+    {
+        if let Some(message) = function_key_message(*named) {
+            return Some(message);
+        }
+    }
+    match (event, status) {
+        (
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Space),
+                ..
+            }),
+            event::Status::Ignored,
+        ) => Some(Message::TogglePause),
+        // „t“ (ohne Modifier, nur wenn kein Textfeld die Taste verbraucht hat)
+        (
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(c),
+                modifiers,
+                ..
+            }),
+            event::Status::Ignored,
+        ) if c.as_str().eq_ignore_ascii_case("t") && modifiers.is_empty() => {
+            Some(Message::OpenTagEditor)
+        }
+        // „p“: Titel zu Playlist hinzufügen
+        (
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(c),
+                modifiers,
+                ..
+            }),
+            event::Status::Ignored,
+        ) if c.as_str().eq_ignore_ascii_case("p") && modifiers.is_empty() => {
+            Some(Message::OpenAddToPlaylist)
+        }
+        (
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                ..
+            }),
+            _,
+        ) => Some(Message::Escape),
+        (
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key:
+                    keyboard::Key::Named(
+                        named @ (keyboard::key::Named::ArrowUp | keyboard::key::Named::ArrowDown),
+                    ),
+                modifiers,
+                ..
+            }),
+            _,
+        ) if modifiers.alt() && !modifiers.command() => Some(Message::MovePlaylistTrack(
+            if named == keyboard::key::Named::ArrowUp {
+                -1
+            } else {
+                1
+            },
+        )),
+        (
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                modifiers,
+                ..
+            }),
+            _,
+        ) => Some(Message::TabPressed(modifiers.shift())),
+        _ => None,
+    }
+}
+
+/// Nächster/vorheriger Eintrag in einer Liste der Länge `len` (ohne Umbruch: an den Enden
+/// bleibt die Auswahl stehen). Ohne bisherige Auswahl: erster bzw. letzter Eintrag.
+fn step_index(len: usize, current: Option<usize>, forward: bool) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match (current, forward) {
+        (None, true) => 0,
+        (None, false) => len - 1,
+        (Some(i), true) => (i + 1).min(len - 1),
+        (Some(i), false) => i.saturating_sub(1),
+    })
+}
+
+/// Scrollt die Liste mit der Id so, dass der Eintrag `index` von `len` im Sichtbereich liegt
+/// (proportional: braucht keine Zeilenhöhen).
+fn snap_list(id: &'static str, index: usize, len: usize) -> Task<Message> {
+    let y = if len <= 1 {
+        0.0
+    } else {
+        index as f32 / (len - 1) as f32
+    };
+    iced::widget::operation::snap_to(id, iced::widget::scrollable::RelativeOffset { x: 0.0, y })
+}
+
+/// Scrollt die Liste mit der Id an den Anfang.
+fn snap_top(id: &'static str) -> Task<Message> {
+    snap_list(id, 0, 1)
+}
+
 impl PlayerApp {
     fn new(library: Library, mut audio: Audio, db_path: PathBuf) -> (Self, Task<Message>) {
         // Kein Ausgabegerät nutzbar: App startet trotzdem, die Statuszeile nennt den Grund
         let startup_error = audio.take_startup_error();
+        let language = lang::detect(library.setting(lang::SETTING_KEY).as_deref());
         let mut app = Self {
             library,
             db_path,
@@ -569,6 +708,7 @@ impl PlayerApp {
             library_empty: true,
             theme: halloy_theme(),
             theme_options: theme_options(),
+            language,
             mixtape_convert: false,
             analyze_bpm: false,
             mixtape_format: mixtape::Format::Opus,
@@ -627,7 +767,7 @@ impl PlayerApp {
             Ok(Some(root)) => root,
             Ok(None) => return Task::none(), // erster Start -> Willkommensseite
             Err(e) => {
-                self.notice = Some(format!("Datenbank-Fehler: {e}"));
+                self.notice = Some(t!("status.db_error", e = e).to_string());
                 return Task::none();
             }
         };
@@ -652,9 +792,7 @@ impl PlayerApp {
                 }
             }
             Err(e) => {
-                self.notice = Some(format!(
-                    "Kein Zugriff mehr auf den Musikordner ({e}). Bitte den Ordner neu auswählen."
-                ));
+                self.notice = Some(t!("notice.folder_access_lost", e = e).to_string());
                 Task::none()
             }
         }
@@ -770,12 +908,9 @@ impl PlayerApp {
     fn handle_device_lost(&mut self) {
         let was_playing = self.audio.is_active();
         self.status = Some(match self.audio.recover_from_lost_device() {
-            Ok(()) if was_playing => {
-                "Ausgabegerät nicht mehr verfügbar – Wiedergabe pausiert, Systemstandard aktiv"
-                    .to_string()
-            }
-            Ok(()) => "Ausgabegerät nicht mehr verfügbar – Systemstandard aktiv".to_string(),
-            Err(e) => format!("Ausgabegerät nicht mehr verfügbar: {e:#}"),
+            Ok(()) if was_playing => t!("status.device_lost_paused").to_string(),
+            Ok(()) => t!("status.device_lost").to_string(),
+            Err(e) => t!("status.device_lost_err", e = format!("{e:#}")).to_string(),
         });
     }
 
@@ -797,71 +932,7 @@ impl PlayerApp {
         };
 
         // Leertaste = Play/Pause (nur wenn kein Widget die Taste verbraucht hat)
-        let keys = event::listen_with(|event, status, _window| match (event, status) {
-            (
-                Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::Space),
-                    ..
-                }),
-                event::Status::Ignored,
-            ) => Some(Message::TogglePause),
-            // „t“ (ohne Modifier, nur wenn kein Textfeld die Taste verbraucht hat)
-            (
-                Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character(c),
-                    modifiers,
-                    ..
-                }),
-                event::Status::Ignored,
-            ) if c.as_str().eq_ignore_ascii_case("t") && modifiers.is_empty() => {
-                Some(Message::OpenTagEditor)
-            }
-            // „p“: Titel zu Playlist hinzufügen
-            (
-                Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character(c),
-                    modifiers,
-                    ..
-                }),
-                event::Status::Ignored,
-            ) if c.as_str().eq_ignore_ascii_case("p") && modifiers.is_empty() => {
-                Some(Message::OpenAddToPlaylist)
-            }
-            (
-                Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                    ..
-                }),
-                _,
-            ) => Some(Message::Escape),
-            (
-                Event::Keyboard(keyboard::Event::KeyPressed {
-                    key:
-                        keyboard::Key::Named(
-                            named @ (keyboard::key::Named::ArrowUp
-                            | keyboard::key::Named::ArrowDown),
-                        ),
-                    modifiers,
-                    ..
-                }),
-                _,
-            ) if modifiers.alt() && !modifiers.command() => Some(Message::MovePlaylistTrack(
-                if named == keyboard::key::Named::ArrowUp {
-                    -1
-                } else {
-                    1
-                },
-            )),
-            (
-                Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::Tab),
-                    modifiers,
-                    ..
-                }),
-                _,
-            ) => Some(Message::TabPressed(modifiers.shift())),
-            _ => None,
-        });
+        let keys = event::listen_with(map_key);
 
         let spinner = if self.mb_running && self.view == View::MusicBrainz {
             time::every(Duration::from_millis(30)).map(|_| Message::SpinnerTick)
@@ -876,7 +947,23 @@ impl PlayerApp {
         match message {
             Message::SelectArtist(id) => {
                 self.load_artist(id);
-                return self.cover_task();
+                return Task::batch([self.cover_task(), snap_top(ALBUMS_PANE)]);
+            }
+            Message::FocusSearch => {
+                if self.phase != Phase::Ready || self.library_empty || self.modal_open() {
+                    return Task::none();
+                }
+                // alten Suchtext markieren, damit sofortiges Tippen ihn ersetzt
+                return Task::batch([
+                    iced::widget::operation::focus(SEARCH_FIELD),
+                    iced::widget::operation::select_all(SEARCH_FIELD),
+                ]);
+            }
+            Message::ShowViewKey(view) => {
+                if self.phase != Phase::Ready || self.library_empty || self.modal_open() {
+                    return Task::none();
+                }
+                return self.update(Message::ShowView(view));
             }
             Message::AlbumCovers(covers) => {
                 for (id, bytes) in covers {
@@ -891,10 +978,9 @@ impl PlayerApp {
                     return Task::none();
                 };
                 if clicked.missing {
-                    self.status = Some(format!(
-                        "Datei nicht in der Mediathek: {}",
-                        clicked.path.display()
-                    ));
+                    self.status = Some(
+                        t!("status.file_not_in_library", path = clicked.path.display()).to_string(),
+                    );
                     return Task::none();
                 }
                 // Fehlende Playlist-Einträge überspringen
@@ -947,9 +1033,22 @@ impl PlayerApp {
             Message::ThemeSelected(theme) => {
                 set_colors(&theme);
                 if let Err(e) = self.library.set_setting("theme", &theme.to_string()) {
-                    self.status = Some(format!("Theme konnte nicht gespeichert werden: {e:#}"));
+                    self.status =
+                        Some(t!("status.theme_save_failed", e = format!("{e:#}")).to_string());
                 }
                 self.theme = theme;
+            }
+            Message::LanguageSelected(l) => {
+                lang::apply(l);
+                self.language = l;
+                // bereits erzeugte Meldungen wären sonst noch in der alten Sprache
+                self.status = None;
+                self.notice = None;
+                self.mb_result = None;
+                if let Err(e) = self.library.set_setting(lang::SETTING_KEY, l.code) {
+                    self.status =
+                        Some(t!("status.setting_save_failed", e = format!("{e:#}")).to_string());
+                }
             }
             Message::MixtapeConvert(on) => {
                 self.mixtape_convert = on;
@@ -957,9 +1056,8 @@ impl PlayerApp {
                     .library
                     .set_setting("mixtape_convert", if on { "1" } else { "0" })
                 {
-                    self.status = Some(format!(
-                        "Einstellung konnte nicht gespeichert werden: {e:#}"
-                    ));
+                    self.status =
+                        Some(t!("status.setting_save_failed", e = format!("{e:#}")).to_string());
                 }
             }
             Message::AnalyzeBpm(on) => {
@@ -969,17 +1067,15 @@ impl PlayerApp {
                     .library
                     .set_setting("bpm_analyze", if on { "1" } else { "0" })
                 {
-                    self.status = Some(format!(
-                        "Einstellung konnte nicht gespeichert werden: {e:#}"
-                    ));
+                    self.status =
+                        Some(t!("status.setting_save_failed", e = format!("{e:#}")).to_string());
                 }
             }
             Message::MixtapeFormat(f) => {
                 self.mixtape_format = f;
                 if let Err(e) = self.library.set_setting("mixtape_format", f.key()) {
-                    self.status = Some(format!(
-                        "Einstellung konnte nicht gespeichert werden: {e:#}"
-                    ));
+                    self.status =
+                        Some(t!("status.setting_save_failed", e = format!("{e:#}")).to_string());
                 }
             }
             Message::ToggleDeviceMenu => {
@@ -1012,7 +1108,7 @@ impl PlayerApp {
             Message::SelectDevice(name) => {
                 self.device_menu_open = false;
                 if let Err(e) = self.audio.set_device(Some(&name)) {
-                    self.status = Some(format!("Ausgabegerät: {e:#}"));
+                    self.status = Some(t!("status.device", e = format!("{e:#}")).to_string());
                 }
             }
             Message::Escape => {
@@ -1075,19 +1171,13 @@ impl PlayerApp {
                 if self.mixtape_convert {
                     self.ffmpeg = mixtape::find_ffmpeg();
                     if self.ffmpeg.is_none() {
-                        self.status = Some(
-                            "Mixtape: Konvertierung ist aktiv, aber ffmpeg wurde nicht gefunden \
-                             (Einstellungen)"
-                                .into(),
-                        );
+                        self.status = Some(t!("status.mixtape_no_ffmpeg").to_string());
                         return Task::none();
                     }
                 }
                 let default_name = format!("{}.zip", db::sanitize_folder_name(&p.name));
                 return Task::perform(
-                    async move {
-                        folder::pick_save_zip("Mixtape speichern unter …", &default_name).await
-                    },
+                    async move { folder::pick_save_zip(&t!("mixtape.save_as"), &default_name).await },
                     move |target| Message::MixtapeTarget(id, target),
                 );
             }
@@ -1104,7 +1194,8 @@ impl PlayerApp {
                 let files: Vec<PathBuf> = match self.library.playlist_tracks(id) {
                     Ok(t) => t.into_iter().map(|t| t.path).collect(),
                     Err(e) => {
-                        self.status = Some(format!("Mixtape fehlgeschlagen: {}", db_error(&e)));
+                        self.status =
+                            Some(t!("status.mixtape_failed", e = db_error(&e)).to_string());
                         return Task::none();
                     }
                 };
@@ -1117,9 +1208,9 @@ impl PlayerApp {
                     _ => None,
                 };
                 self.status = Some(if convert.is_some() {
-                    format!("Mixtape „{name}“ wird erstellt und konvertiert …")
+                    t!("status.mixtape_converting", name = name).to_string()
                 } else {
-                    format!("Mixtape „{name}“ wird erstellt …")
+                    t!("status.mixtape_creating", name = name).to_string()
                 });
                 // ZIP schreiben im Hintergrund (viele/große Dateien)
                 return Task::perform(
@@ -1142,16 +1233,25 @@ impl PlayerApp {
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        let mut extra = String::new();
+                        let mut parts = vec![if written == 1 {
+                            t!("mixtape.n_tracks_one", count = written).to_string()
+                        } else {
+                            t!("mixtape.n_tracks_other", count = written).to_string()
+                        }];
                         if converted > 0 {
-                            extra.push_str(&format!(", {converted} konvertiert"));
+                            parts.push(t!("mixtape.n_converted", count = converted).to_string());
                         }
                         if skipped > 0 {
-                            extra.push_str(&format!(", {skipped} nicht gefunden"));
+                            parts.push(t!("mixtape.n_missing", count = skipped).to_string());
                         }
-                        format!("Mixtape gespeichert: {file} ({written} Titel{extra})")
+                        t!(
+                            "status.mixtape_saved",
+                            file = file,
+                            summary = parts.join(", ")
+                        )
+                        .to_string()
                     }
-                    Err(e) => format!("Mixtape fehlgeschlagen: {e}"),
+                    Err(e) => t!("status.mixtape_failed", e = e).to_string(),
                 });
             }
             Message::AskRenamePlaylist(id) => {
@@ -1192,7 +1292,7 @@ impl PlayerApp {
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        self.status = Some(format!("Verschieben fehlgeschlagen: {}", db_error(&e)))
+                        self.status = Some(t!("status.move_failed", e = db_error(&e)).to_string())
                     }
                 }
             }
@@ -1213,7 +1313,7 @@ impl PlayerApp {
                             self.playlist_dialog = None;
                             self.load_playlists();
                         }
-                        Ok(false) => *error = Some("Der Titel ist schon in dieser Playlist".into()),
+                        Ok(false) => *error = Some(t!("playlist.already_in").to_string()),
                         Err(e) => *error = Some(db_error(&e)),
                     }
                 }
@@ -1248,7 +1348,7 @@ impl PlayerApp {
                     let id = *id;
                     if let Err(e) = self.library.delete_playlist(id) {
                         self.status =
-                            Some(format!("Playlist löschen fehlgeschlagen: {}", db_error(&e)));
+                            Some(t!("status.playlist_delete_failed", e = db_error(&e)).to_string());
                     }
                     self.playlist_dialog = None;
                     if self.pl_selected == Some(id) {
@@ -1261,7 +1361,8 @@ impl PlayerApp {
             Message::RemoveFromPlaylist(path) => {
                 if let Some(id) = self.pl_selected {
                     if let Err(e) = self.library.remove_from_playlist(id, &path) {
-                        self.status = Some(format!("Entfernen fehlgeschlagen: {}", db_error(&e)));
+                        self.status =
+                            Some(t!("status.remove_failed", e = db_error(&e)).to_string());
                     }
                     self.select_playlist(Some(id));
                 }
@@ -1300,7 +1401,10 @@ impl PlayerApp {
                         });
                         return iced::widget::operation::focus(TAG_FIRST_FIELD);
                     }
-                    Err(e) => self.status = Some(format!("Tags nicht lesbar: {e:#}")),
+                    Err(e) => {
+                        self.status =
+                            Some(t!("status.tags_unreadable", e = format!("{e:#}")).to_string())
+                    }
                 }
             }
             Message::CancelTagEditor => {
@@ -1316,6 +1420,9 @@ impl PlayerApp {
                     } else {
                         iced::widget::operation::focus_next()
                     };
+                }
+                if self.phase == Phase::Ready && !self.device_menu_open {
+                    return self.step_column(!shift);
                 }
             }
             Message::EditTag(field, value) => {
@@ -1370,7 +1477,7 @@ impl PlayerApp {
             Message::TagsSaved(Err(e)) => {
                 if let Some(ed) = &mut self.tag_editor {
                     ed.saving = false;
-                    ed.error = Some(format!("Schreiben fehlgeschlagen: {e}"));
+                    ed.error = Some(t!("tags.write_failed", e = e).to_string());
                 }
             }
             Message::TagsSaved(Ok(())) => {
@@ -1444,10 +1551,14 @@ impl PlayerApp {
                     self.reload_mb_albums();
                 }
                 self.mb_result = Some(match res {
-                    Ok((updated, checked, images)) => format!(
-                        "{updated} neue MBIDs eingetragen ({checked} Alben geprüft), {images} Bilder"
-                    ),
-                    Err(e) => format!("MusicBrainz fehlgeschlagen: {e}"),
+                    Ok((updated, checked, images)) => t!(
+                        "mb.result",
+                        updated = updated,
+                        checked = checked,
+                        images = images
+                    )
+                    .to_string(),
+                    Err(e) => t!("mb.failed", e = e).to_string(),
                 });
             }
             Message::SpinnerTick => {
@@ -1467,7 +1578,7 @@ impl PlayerApp {
 
                 // … und das Ergebnis des Ordner-Dialogs in der Datenbank speichern.
                 if let Err(e) = self.library.set_music_root(&MusicRoot { path, bookmark }) {
-                    self.notice = Some(format!("Ordner konnte nicht gespeichert werden: {e}"));
+                    self.notice = Some(t!("notice.folder_save_failed", e = e).to_string());
                     return Task::none();
                 }
                 self.access = Some(access); // gibt den Zugriff auf den alten Ordner frei
@@ -1538,16 +1649,12 @@ impl PlayerApp {
                 self.album_covers.clear();
                 self.cover_pending.clear();
                 self.reload_library_view();
-                self.notice = (count == 0).then(|| {
-                    "Keine Musikdateien gefunden. Erwartet wird die Struktur \
-                     Künstler/Album/Titel (mp3, aac, m4a, opus)."
-                        .to_string()
-                });
+                self.notice = (count == 0).then(|| t!("notice.no_music_files").to_string());
                 return self.cover_task();
             }
             Message::ScanFinished(Err(e)) => {
                 self.phase = Phase::NeedsFolder;
-                self.notice = Some(format!("Einlesen fehlgeschlagen: {e}"));
+                self.notice = Some(t!("notice.scan_failed", e = e).to_string());
             }
         }
         Task::none()
@@ -1559,7 +1666,7 @@ impl PlayerApp {
             .library
             .update_track_tags(ed.track_id, &ed.path, &ed.fields)
         {
-            self.status = Some(format!("Datenbank-Update fehlgeschlagen: {e:#}"));
+            self.status = Some(t!("status.db_update_failed", e = format!("{e:#}")).to_string());
             return;
         }
         let f = &ed.fields;
@@ -1588,6 +1695,49 @@ impl PlayerApp {
     }
 
     // --- Navigation ------------------------------------------------------
+
+    /// Dialog oder Popover offen? Dann greifen die Navigationstasten nicht.
+    fn modal_open(&self) -> bool {
+        self.tag_editor.is_some() || self.playlist_dialog.is_some() || self.device_menu_open
+    }
+
+    /// Tab / Umschalt+Tab: in der linken Spalte der Music- bzw. Compilations-Ansicht einen
+    /// Eintrag weiter bzw. zurück (Künstler bzw. „Alle Alben“ + Alben).
+    fn step_column(&mut self, forward: bool) -> Task<Message> {
+        match self.view {
+            View::Music => {
+                let current = self
+                    .selected_artist
+                    .and_then(|id| self.artists.iter().position(|a| a.id == id));
+                let Some(i) = step_index(self.artists.len(), current, forward) else {
+                    return Task::none();
+                };
+                let id = self.artists[i].id;
+                self.load_artist(id);
+                Task::batch([
+                    self.cover_task(),
+                    snap_list(ARTIST_LIST, i, self.artists.len()),
+                    snap_top(ALBUMS_PANE),
+                ])
+            }
+            View::Compilations => {
+                // Einträge: [Alle Alben, Album 1, Album 2, …]
+                let current = self
+                    .comp_selected_album
+                    .and_then(|id| self.comp_albums.iter().position(|a| a.id == id))
+                    .map(|p| p + 1)
+                    .unwrap_or(0);
+                let len = self.comp_albums.len() + 1;
+                let Some(i) = step_index(len, Some(current), forward) else {
+                    return Task::none();
+                };
+                let album = (i > 0).then(|| self.comp_albums[i - 1].id);
+                self.select_comp_album(album);
+                snap_list(COMP_ALBUM_LIST, i, len)
+            }
+            _ => Task::none(),
+        }
+    }
 
     fn load_compilations(&mut self) {
         self.comp_selected_album = None;
@@ -1725,7 +1875,7 @@ impl PlayerApp {
         let lost = self.audio.take_device_lost();
         if lost {
             if let Err(e) = self.audio.recover_from_lost_device() {
-                self.status = Some(format!("Ausgabegerät nicht mehr verfügbar: {e:#}"));
+                self.status = Some(t!("status.device_lost_err", e = format!("{e:#}")).to_string());
                 return;
             }
         }
@@ -1743,17 +1893,12 @@ impl PlayerApp {
                     })
                     .map(image::Handle::from_bytes);
                 self.seek_preview = None;
-                self.status = lost.then(|| {
-                    "Ausgabegerät nicht mehr verfügbar – Systemstandard aktiv".to_string()
-                });
+                self.status = lost.then(|| t!("status.device_lost").to_string());
             }
             Err(e) if folder::is_permission_denied(&e) => {
-                self.status = Some(
-                    "Zugriff verweigert – bitte den Musikordner über „Ordner ändern …“ neu auswählen."
-                        .to_string(),
-                );
+                self.status = Some(t!("status.permission_denied").to_string());
             }
-            Err(e) => self.status = Some(format!("Fehler beim Abspielen: {e}")),
+            Err(e) => self.status = Some(t!("status.play_failed", e = e).to_string()),
         }
     }
 
@@ -1806,7 +1951,7 @@ impl PlayerApp {
         match self.phase {
             Phase::Scanning => container(
                 column![
-                    text("Mediathek wird aufgebaut …").size(22),
+                    text(t!("library.building").to_string()).size(22),
                     text(self.root_label()).size(12),
                 ]
                 .spacing(8)
@@ -1869,24 +2014,21 @@ impl PlayerApp {
 
     /// Startseite: noch kein (gültiger) Musikordner.
     fn welcome(&self) -> Element<'_, Message> {
-        let mut col = column![
-            text("FYA").size(28),
-            text("Wähle den Ordner mit deiner Musik (Struktur: Künstler / Album / Titel)."),
-        ]
-        .spacing(12)
-        .align_x(Alignment::Center);
+        let mut col = column![text("FYA").size(28), text(t!("welcome.choose").to_string()),]
+            .spacing(12)
+            .align_x(Alignment::Center);
 
         if let Some(notice) = &self.notice {
             col = col.push(text(notice.as_str()).size(13));
         }
-        col = col.push(button("Musikordner wählen …").on_press(Message::PickFolder));
+        col = col.push(button(text(t!("welcome.pick").to_string())).on_press(Message::PickFolder));
 
         container(col).center(Length::Fill).into()
     }
 
     /// Schmale Buttonleiste links (wie die Kanalliste in Halloy).
     fn sidebar(&self) -> Element<'_, Message> {
-        let entry = |glyph: &'static [u8], label: &'static str, on_press: Message| {
+        let entry = |glyph: &'static [u8], label: String, on_press: Message| {
             button(
                 row![
                     icon(glyph, 16.0, col().text),
@@ -1917,7 +2059,8 @@ impl PlayerApp {
             .on_press(on_press)
         };
         let search = stack![
-            text_input("Suche", &self.search)
+            text_input(&t!("search.placeholder"), &self.search)
+                .id(SEARCH_FIELD)
                 .on_input(Message::SearchChanged)
                 .padding(Padding {
                     top: 7.0,
@@ -1936,24 +2079,36 @@ impl PlayerApp {
         ];
         column![
             search,
-            entry(ICON_MUSIC, "Music", Message::ShowView(View::Music)),
+            entry(
+                ICON_MUSIC,
+                t!("nav.music").into(),
+                Message::ShowView(View::Music)
+            ),
             entry(
                 ICON_COMPILATIONS,
-                "Compilations",
+                t!("nav.compilations").into(),
                 Message::ShowView(View::Compilations)
             ),
             entry(
                 ICON_PLAYLISTS,
-                "Playlists",
+                t!("nav.playlists").into(),
                 Message::ShowView(View::Playlists)
             ),
             entry(
                 ICON_HEXAGON,
-                "MusicBrainz",
+                "MusicBrainz".into(),
                 Message::ShowView(View::MusicBrainz)
             ),
-            entry(ICON_SETTINGS, "Settings", Message::ShowView(View::Settings)),
-            entry(ICON_HELP, "Help", Message::ShowView(View::Help))
+            entry(
+                ICON_SETTINGS,
+                t!("nav.settings").into(),
+                Message::ShowView(View::Settings)
+            ),
+            entry(
+                ICON_HELP,
+                t!("nav.help").into(),
+                Message::ShowView(View::Help)
+            )
         ]
         .spacing(4)
         .width(Length::Fixed(157.0))
@@ -1968,7 +2123,7 @@ impl PlayerApp {
         let f = &ed.fields;
         let saving = ed.saving;
 
-        let field = |label: &'static str, value: &str, kind: TagField| {
+        let field = |label: String, value: &str, kind: TagField| {
             let mut input = text_input("", value).padding(6).size(14);
             if !saving {
                 input = input
@@ -1985,7 +2140,7 @@ impl PlayerApp {
             .spacing(8)
             .align_y(Alignment::Center)
         };
-        let small = |label: &'static str, value: &str, kind: TagField| {
+        let small = |label: String, value: &str, kind: TagField| {
             let mut input = text_input("", value).padding(6).size(14).width(62);
             if !saving {
                 input = input
@@ -1997,13 +2152,13 @@ impl PlayerApp {
                 .align_y(Alignment::Center)
         };
 
-        let mut compilation = checkbox(f.compilation).label("Compilation");
+        let mut compilation = checkbox(f.compilation).label(t!("tags.compilation").to_string());
         if !saving {
             compilation = compilation.on_toggle(Message::EditCompilation);
         }
 
         let mut col = column![
-            text("Metadaten bearbeiten").size(20),
+            text(t!("tags.title").to_string()).size(20),
             // Relativer Pfad; Klick zeigt die Datei im Finder
             button(text(ed.rel_path.as_str()).size(12))
                 .padding(0)
@@ -2019,18 +2174,26 @@ impl PlayerApp {
                     ..button::Style::default()
                 })
                 .on_press(Message::RevealFile(ed.path.clone())),
-            field("Titel", &f.title, TagField::Title),
-            field("Künstler", &f.artist, TagField::Artist),
-            field("Album", &f.album, TagField::Album),
-            field("Albumkünstler", &f.album_artist, TagField::AlbumArtist),
-            field("Komponist", &f.composer, TagField::Composer),
-            field("Genre", &f.genre, TagField::Genre),
+            field(t!("tags.f.title").into(), &f.title, TagField::Title),
+            field(t!("tags.f.artist").into(), &f.artist, TagField::Artist),
+            field(t!("tags.f.album").into(), &f.album, TagField::Album),
+            field(
+                t!("tags.f.album_artist").into(),
+                &f.album_artist,
+                TagField::AlbumArtist
+            ),
+            field(
+                t!("tags.f.composer").into(),
+                &f.composer,
+                TagField::Composer
+            ),
+            field(t!("tags.f.genre").into(), &f.genre, TagField::Genre),
             row![
-                small("Track", &f.track_no, TagField::TrackNo),
-                small("von", &f.track_total, TagField::TrackTotal),
-                small("Disc", &f.disc_no, TagField::DiscNo),
-                small("Jahr", &f.year, TagField::Year),
-                small("BPM", &f.bpm, TagField::Bpm),
+                small(t!("db.field.track").into(), &f.track_no, TagField::TrackNo),
+                small(t!("tags.f.of").into(), &f.track_total, TagField::TrackTotal),
+                small(t!("db.field.disc").into(), &f.disc_no, TagField::DiscNo),
+                small(t!("db.field.year").into(), &f.year, TagField::Year),
+                small("BPM".into(), &f.bpm, TagField::Bpm),
             ]
             .spacing(12),
             compilation,
@@ -2045,9 +2208,14 @@ impl PlayerApp {
         }
         col = col.push(
             row![
-                button("Abbrechen").on_press_maybe((!saving).then_some(Message::CancelTagEditor)),
-                button(if saving { "Speichern …" } else { "Speichern" })
-                    .on_press_maybe((!saving).then_some(Message::SaveTags)),
+                button(text(t!("common.cancel").to_string()))
+                    .on_press_maybe((!saving).then_some(Message::CancelTagEditor)),
+                button(text(if saving {
+                    t!("tags.saving").to_string()
+                } else {
+                    t!("tags.save").to_string()
+                }))
+                .on_press_maybe((!saving).then_some(Message::SaveTags)),
             ]
             .spacing(8),
         );
@@ -2107,7 +2275,7 @@ impl PlayerApp {
         });
 
         const SIDE: f32 = 240.0;
-        let slot = |label: &'static str, handle: &Option<image::Handle>| -> Element<'_, Message> {
+        let slot = |label: String, handle: &Option<image::Handle>| -> Element<'_, Message> {
             let body: Element<'_, Message> = match (self.mb_selected, handle) {
                 (Some(_), Some(h)) => image(h.clone())
                     .width(Length::Fill)
@@ -2130,7 +2298,7 @@ impl PlayerApp {
         };
         // Knopf zentriert; darunter Spinner bzw. Ergebnistext (ebenfalls zentriert)
         let mut run = column![
-            button("MusicBrainz abfragen")
+            button(text(t!("mb.query").to_string()))
                 .on_press_maybe((!self.mb_running).then_some(Message::MusicBrainz))
         ]
         .spacing(8)
@@ -2153,8 +2321,8 @@ impl PlayerApp {
 
         let images = container(
             column![
-                slot("KÜNSTLER", &self.mb_artist_image),
-                slot("ALBUM", &self.mb_album_image),
+                slot(t!("pane.artists").to_uppercase(), &self.mb_artist_image),
+                slot(t!("pane.album").to_uppercase(), &self.mb_album_image),
                 container(run).center_x(Length::Fill),
             ]
             .spacing(12),
@@ -2164,7 +2332,7 @@ impl PlayerApp {
         .height(Length::Fill)
         .style(panel_style);
 
-        row![pane("ALBEN", list.into()), images]
+        row![pane(t!("pane.albums").to_uppercase(), list.into()), images]
             .spacing(8)
             .height(Length::Fill)
             .into()
@@ -2174,7 +2342,7 @@ impl PlayerApp {
     /// Hilfe: alle Tasten + Danksagungen.
     fn help_view(&self) -> Element<'_, Message> {
         let c = col();
-        let key = |keys: &'static str, what: &'static str| -> Element<'static, Message> {
+        let key = |keys: String, what: String| -> Element<'static, Message> {
             row![
                 container(text(keys).size(13).color(c.text))
                     .padding([2, 8])
@@ -2194,8 +2362,8 @@ impl PlayerApp {
             .align_y(Alignment::Center)
             .into()
         };
-        let heading = |t: &'static str| text(t).size(12).color(c.dim);
-        let credit = |name: &'static str, what: &'static str, license: &'static str| {
+        let heading = |t: String| text(t).size(12).color(c.dim);
+        let credit = |name: String, what: String, license: String| {
             column![
                 text(name).size(15),
                 text(what).size(13),
@@ -2205,55 +2373,80 @@ impl PlayerApp {
         };
 
         let content = column![
-            heading("TASTEN"),
+            heading(t!("help.keys").to_uppercase()),
             column![
-                key("Leertaste", "Wiedergabe starten / pausieren"),
-                key("t", "Metadaten (Tags) des laufenden Titels bearbeiten (Music, Compilations, Playlists)"),
-                key("p", "Laufenden Titel zu einer Playlist hinzufügen"),
-                key("Alt + ↑ / Alt + ↓", "Laufenden Titel in der Playlist nach oben / unten verschieben"),
-                key("Tab / Umschalt + Tab", "In Dialogen zum nächsten / vorherigen Feld wechseln"),
-                key("Enter", "In Dialogen speichern bzw. bestätigen"),
-                key("Esc", "Dialog schließen"),
+                key("Space".into(), t!("help.k.space").into()),
+                key("t".into(), t!("help.k.t").into()),
+                key("p".into(), t!("help.k.p").into()),
+                key(move_keys(), t!("help.k.move").into()),
+                key("Select".into(), t!("help.k.select").into()),
+                key("F1 … F6".into(), t!("help.k.tabs").into()),
+                key(t!("help.k.tab_keys").into(), t!("help.k.tab").into()),
+                key("Enter".into(), t!("help.k.enter").into()),
+                key("Esc".into(), t!("help.k.esc").into()),
             ]
             .spacing(8),
-            heading("MAUS"),
+            heading(t!("help.mouse").to_uppercase()),
             column![
-                key("Klick auf Titel", "Titel abspielen (die sichtbare Liste ist die Wiedergabeliste)"),
-                key("Suchfeld", "Sucht ab zwei Zeichen in Künstler, Album und Titel; „:120“ oder „:120-130“ filtert nach BPM"),
-                key("Trennlinien ziehen", "Spaltenbreiten ändern"),
-                key("Lautsprecher-Knopf (Player)", "Ausgabegerät wählen (z. B. Bluetooth-Lautsprecher). Es wird nie automatisch gewechselt; verschwindet das Gerät, pausiert die Wiedergabe und der Systemstandard wird aktiv"),
-                key("❣️ (Playlists)", "Mixtape: Playlist als ZIP speichern (optional per ffmpeg konvertiert, siehe Einstellungen)"),
-                key("✎ / ✕ (Playlists)", "Playlist umbenennen / löschen bzw. Titel entfernen"),
+                key(
+                    t!("help.m.click_track_key").into(),
+                    t!("help.m.click_track").into()
+                ),
+                key(t!("help.m.search_key").into(), t!("help.m.search").into()),
+                key(t!("help.m.drag_key").into(), t!("help.m.drag").into()),
+                key(t!("help.m.speaker_key").into(), t!("help.m.speaker").into()),
+                key(t!("help.m.mixtape_key").into(), t!("help.m.mixtape").into()),
+                key(t!("help.m.edit_key").into(), t!("help.m.edit").into()),
             ]
             .spacing(8),
-            heading("ACKNOWLEDGEMENTS"),
-            text("FYA nutzt unter anderem freie Software von:").size(13),
+            heading("ACKNOWLEDGEMENTS".into()),
+            text(t!("help.credits_intro").to_string()).size(13),
             column![
-                credit("iced", "Plattformübergreifende GUI-Bibliothek für Rust (iced.rs)", "MIT-Lizenz"),
-                credit("rodio", "Audio-Wiedergabe (github.com/RustAudio/rodio)", "MIT oder Apache-2.0"),
-                credit("lofty", "Lesen und Schreiben von Audio-Tags (github.com/Serial-ATA/lofty-rs)", "MIT oder Apache-2.0"),
-                credit("opus-rs", "Opus-Decoder in Rust (github.com/restsend/opus-rs)", "BSD-3-Clause"),
-                credit("Lucide", "Icons (lucide.dev)", "ISC-Lizenz"),
+                credit(
+                    "iced".into(),
+                    t!("help.c.iced").into(),
+                    t!("help.lic.mit").into()
+                ),
+                credit(
+                    "rodio".into(),
+                    t!("help.c.rodio").into(),
+                    t!("help.lic.mit_apache").into()
+                ),
+                credit(
+                    "lofty".into(),
+                    t!("help.c.lofty").into(),
+                    t!("help.lic.mit_apache").into()
+                ),
+                credit(
+                    "opus-rs".into(),
+                    t!("help.c.opus").into(),
+                    "BSD-3-Clause".into()
+                ),
+                credit(
+                    "Lucide".into(),
+                    t!("help.c.lucide").into(),
+                    t!("help.lic.isc").into()
+                ),
             ]
             .extend(cfg!(feature = "bpm").then(|| {
                 Element::from(credit(
-                    "bpm-analyzer",
-                    "BPM-Erkennung (github.com/not-jan/bpm-analyzer)",
-                    "MIT-Lizenz",
+                    "bpm-analyzer".into(),
+                    t!("help.c.bpm").into(),
+                    t!("help.lic.mit").into(),
                 ))
             }))
             .spacing(10),
         ]
         .spacing(14);
 
-        pane("HILFE", content.into())
+        pane(t!("pane.help").to_uppercase(), content.into())
     }
 
     /// „Mixtapes immer konvertieren in: [Format]“ – nur aktiv, wenn ffmpeg gefunden wurde.
     fn mixtape_setting(&self) -> Element<'_, Message> {
         let available = self.ffmpeg.is_some();
-        let mut checkbox =
-            checkbox(self.mixtape_convert && available).label("Mixtapes immer konvertieren in:");
+        let mut checkbox = checkbox(self.mixtape_convert && available)
+            .label(t!("settings.mixtape_convert").to_string());
         let mut formats = row![].spacing(10).align_y(Alignment::Center);
         if available {
             checkbox = checkbox.on_toggle(Message::MixtapeConvert);
@@ -2266,7 +2459,11 @@ impl PlayerApp {
             // ohne ffmpeg: nicht bedienbar, Format nur anzeigen + Hinweis
             formats = formats
                 .push(text(self.mixtape_format.to_string()).color(col().dim))
-                .push(text("Benötigt ffmpeg").size(13).color(col().warn));
+                .push(
+                    text(t!("settings.needs_ffmpeg").to_string())
+                        .size(13)
+                        .color(col().warn),
+                );
         }
         row![checkbox, formats]
             .spacing(10)
@@ -2277,29 +2474,34 @@ impl PlayerApp {
     fn settings_view(&self) -> Element<'_, Message> {
         container(
             column![
-                text("EINSTELLUNGEN").size(12).color(col().dim),
-                text("Musikbibliothek").size(12),
+                text(t!("pane.settings").to_uppercase())
+                    .size(12)
+                    .color(col().dim),
+                text(t!("settings.library").to_string()).size(12),
                 text(self.root_label()).size(13),
                 row![
-                    button("Ordner ändern …").on_press(Message::PickFolder),
-                    button("Neu einlesen").on_press(Message::Rescan),
+                    button(text(t!("settings.change_folder").to_string()))
+                        .on_press(Message::PickFolder),
+                    button(text(t!("settings.rescan").to_string())).on_press(Message::Rescan),
                 ]
                 .spacing(8),
-                text("Design").size(12),
+                text(t!("settings.design").to_string()).size(12),
                 pick_list(
                     self.theme_options.as_slice(),
                     Some(&self.theme),
                     Message::ThemeSelected,
                 ),
-                text("Mixtape").size(12),
+                text(t!("settings.language").to_string()).size(12),
+                pick_list(lang::LANGS, Some(self.language), Message::LanguageSelected,),
+                text(t!("settings.mixtape").to_string()).size(12),
                 self.mixtape_setting(),
             ]
             // BPM-Analyse: nur mit dem Feature `bpm`
             .extend(if cfg!(feature = "bpm") {
                 vec![
-                    text("Analyse").size(12).into(),
+                    text(t!("settings.analysis").to_string()).size(12).into(),
                     checkbox(self.analyze_bpm)
-                        .label("BPM der gespielten Titel analysieren")
+                        .label(t!("settings.analyze_bpm").to_string())
                         .on_toggle(Message::AnalyzeBpm)
                         .into(),
                 ]
@@ -2323,7 +2525,11 @@ impl PlayerApp {
                 Message::SelectArtist(a.id),
             )
         }));
-        pane("KÜNSTLER", list.into())
+        pane_with_id(
+            t!("pane.artists").to_uppercase(),
+            Some(ARTIST_LIST),
+            list.into(),
+        )
     }
 
     /// Music: alle Alben des Künstlers untereinander. Pro Album ein Kopf (Cover,
@@ -2387,7 +2593,11 @@ impl PlayerApp {
             right: 14.0,
             ..Padding::ZERO
         });
-        pane("ALBEN", content.into())
+        pane_with_id(
+            t!("pane.albums").to_uppercase(),
+            Some(ALBUMS_PANE),
+            content.into(),
+        )
     }
 
     /// Zeilen mit Nummer, Titel, optional Künstler/Album und Dauer. Jeder Eintrag
@@ -2457,7 +2667,7 @@ impl PlayerApp {
             right: 14.0,
             ..Padding::ZERO
         });
-        pane("TITEL", list.into())
+        pane(t!("pane.tracks").to_uppercase(), list.into())
     }
 
     /// Popover über dem Lautsprecher-Knopf: Systemstandard + alle Ausgabegeräte.
@@ -2480,7 +2690,7 @@ impl PlayerApp {
         }
         if self.devices.is_empty() {
             items = items.push(
-                text("Keine Ausgabegeräte gefunden")
+                text(t!("device.none").to_string())
                     .size(13)
                     .color(col().dim),
             );
@@ -2488,7 +2698,9 @@ impl PlayerApp {
 
         let menu = container(
             column![
-                text("AUSGABEGERÄT").size(12).color(col().dim),
+                text(t!("device.title").to_uppercase())
+                    .size(12)
+                    .color(col().dim),
                 scrollable(items).height(Length::Shrink),
             ]
             .spacing(6),
@@ -2523,32 +2735,36 @@ impl PlayerApp {
         let err = err_text;
         let content: Element<'_, Message> = match dialog {
             PlaylistDialog::New { name, error, .. } => column![
-                text("Neue Playlist").size(20),
-                text_input("Name", name)
+                text(t!("playlist.new").to_string()).size(20),
+                text_input(&t!("playlist.name"), name)
                     .id(PLAYLIST_NAME_FIELD)
                     .on_input(Message::PlaylistName)
                     .on_submit(Message::ConfirmPlaylistDialog)
                     .padding(6),
                 err(error),
                 row![
-                    button("Abbrechen").on_press(Message::ClosePlaylistDialog),
-                    button("Anlegen").on_press(Message::ConfirmPlaylistDialog),
+                    button(text(t!("common.cancel").to_string()))
+                        .on_press(Message::ClosePlaylistDialog),
+                    button(text(t!("playlist.create").to_string()))
+                        .on_press(Message::ConfirmPlaylistDialog),
                 ]
                 .spacing(8),
             ]
             .spacing(10)
             .into(),
             PlaylistDialog::Rename { name, error, .. } => column![
-                text("Playlist umbenennen").size(20),
-                text_input("Name", name)
+                text(t!("playlist.rename_title").to_string()).size(20),
+                text_input(&t!("playlist.name"), name)
                     .id(PLAYLIST_NAME_FIELD)
                     .on_input(Message::PlaylistName)
                     .on_submit(Message::ConfirmPlaylistDialog)
                     .padding(6),
                 err(error),
                 row![
-                    button("Abbrechen").on_press(Message::ClosePlaylistDialog),
-                    button("Umbenennen").on_press(Message::ConfirmPlaylistDialog),
+                    button(text(t!("common.cancel").to_string()))
+                        .on_press(Message::ClosePlaylistDialog),
+                    button(text(t!("playlist.rename").to_string()))
+                        .on_press(Message::ConfirmPlaylistDialog),
                 ]
                 .spacing(8),
             ]
@@ -2569,24 +2785,28 @@ impl PlayerApp {
                     .into()
                 };
                 column![
-                    text("Zu Playlist hinzufügen").size(20),
+                    text(t!("playlist.add_to").to_string()).size(20),
                     text(title.as_str()).size(12).color(col().dim),
                     container(list).max_height(260),
-                    button("+ Neue Playlist …").on_press(Message::AddToNewPlaylist),
+                    button(text(t!("playlist.add_new").to_string()))
+                        .on_press(Message::AddToNewPlaylist),
                     err(error),
-                    button("Abbrechen").on_press(Message::ClosePlaylistDialog),
+                    button(text(t!("common.cancel").to_string()))
+                        .on_press(Message::ClosePlaylistDialog),
                 ]
                 .spacing(10)
                 .into()
             }
             PlaylistDialog::Delete { name, .. } => column![
-                text(format!("Playlist „{name}“ löschen?")).size(20),
-                text("Die Titeldateien bleiben erhalten.")
+                text(t!("playlist.delete_q", name = name).to_string()).size(20),
+                text(t!("playlist.delete_hint").to_string())
                     .size(13)
                     .color(col().dim),
                 row![
-                    button("Abbrechen").on_press(Message::ClosePlaylistDialog),
-                    button("Löschen").on_press(Message::ConfirmPlaylistDialog),
+                    button(text(t!("common.cancel").to_string()))
+                        .on_press(Message::ClosePlaylistDialog),
+                    button(text(t!("playlist.delete").to_string()))
+                        .on_press(Message::ConfirmPlaylistDialog),
                 ]
                 .spacing(8),
             ]
@@ -2631,11 +2851,12 @@ impl PlayerApp {
                         .into()
                     };
                     let content = column![
-                        button("+ Neue Playlist").on_press(Message::NewPlaylist),
+                        button(text(t!("playlist.new_plus").to_string()))
+                            .on_press(Message::NewPlaylist),
                         list
                     ]
                     .spacing(8);
-                    pane("PLAYLIST", content.into())
+                    pane(t!("pane.playlist").to_uppercase(), content.into())
                 }
             })
         })
@@ -2659,7 +2880,7 @@ impl PlayerApp {
                 ),
                 _ => {
                     let all = list_button(
-                        text("Alle Alben").into(),
+                        text(t!("comp.all_albums").to_string()).into(),
                         self.comp_selected_album.is_none(),
                         Message::SelectCompAlbum(None),
                     );
@@ -2674,8 +2895,9 @@ impl PlayerApp {
                             Message::SelectCompAlbum(Some(a.id)),
                         )
                     });
-                    pane(
-                        "COMPILATIONS",
+                    pane_with_id(
+                        t!("nav.compilations").to_uppercase(),
+                        Some(COMP_ALBUM_LIST),
                         column(std::iter::once(all).chain(albums)).into(),
                     )
                 }
@@ -2708,7 +2930,7 @@ impl PlayerApp {
                     .unwrap_or(&t.album_title);
                 format!("{artist} — {album}")
             }),
-            (None, None) => ("Kein Titel ausgewählt".to_string(), String::new()),
+            (None, None) => (t!("player.no_track").to_string(), String::new()),
         };
 
         let dur = current.map(|t| t.duration_secs).unwrap_or(0) as f32;
@@ -2791,7 +3013,23 @@ impl PlayerApp {
 /// Name des Sammel-Künstlers (Ordner „Compilations“) – eigene Ansicht
 const COMPILATIONS: &str = "Compilations";
 
+/// Tastenkombination zum Verschieben in der Playlist, wie sie die Hilfe nennt: Die Taste
+/// heißt auf dem Mac „Option“, sonst „Alt“ (dasselbe Modifier-Flag `alt`).
+fn move_keys() -> String {
+    if cfg!(target_os = "macos") {
+        "Option + ↑ / Option + ↓".into()
+    } else {
+        "Alt + ↑ / Alt + ↓".into()
+    }
+}
+
 /// ID des Namensfeldes im „Neue Playlist“-Dialog
+/// Ids für Fokus und Scrollen per Tastatur
+const SEARCH_FIELD: &str = "search-field";
+const ARTIST_LIST: &str = "artist-list";
+const ALBUMS_PANE: &str = "albums-pane";
+const COMP_ALBUM_LIST: &str = "comp-album-list";
+
 const PLAYLIST_NAME_FIELD: &str = "playlist-name";
 
 /// ID des ersten Feldes im Tag-Editor (Fokus beim Öffnen)
@@ -2844,19 +3082,26 @@ fn icon_button(data: &'static [u8], on_press: Message) -> Element<'static, Messa
 }
 
 /// Spalte mit Überschrift und scrollbarem Inhalt.
-fn pane<'a>(title: &'a str, content: Element<'a, Message>) -> Element<'a, Message> {
-    container(
-        column![
-            text(title).size(12).color(col().dim),
-            scrollable(content).height(Length::Fill).width(Length::Fill),
-        ]
-        .spacing(6),
-    )
-    .padding(8)
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .style(panel_style)
-    .into()
+fn pane<'a>(title: String, content: Element<'a, Message>) -> Element<'a, Message> {
+    pane_with_id(title, None, content)
+}
+
+/// Wie [`pane`], die Scroll-Liste mit fester Id (für `snap_to`).
+fn pane_with_id<'a>(
+    title: String,
+    id: Option<&'static str>,
+    content: Element<'a, Message>,
+) -> Element<'a, Message> {
+    let mut list = scrollable(content).height(Length::Fill).width(Length::Fill);
+    if let Some(id) = id {
+        list = list.id(id);
+    }
+    container(column![text(title).size(12).color(col().dim), list,].spacing(6))
+        .padding(8)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(panel_style)
+        .into()
 }
 
 /// Klickbare Listenzeile; `selected` hebt sie hervor.
@@ -2936,9 +3181,7 @@ fn db_error(e: &anyhow::Error) -> String {
         )
     });
     if busy {
-        "Die Datenbank ist gerade belegt (MusicBrainz-Abgleich oder Einlesen läuft). \
-         Bitte kurz warten und erneut versuchen."
-            .to_string()
+        t!("db.busy").to_string()
     } else {
         format!("{e:#}")
     }
@@ -2995,6 +3238,7 @@ mod db_error_tests {
             rusqlite::ffi::Error::new(5), // SQLITE_BUSY
             Some("database is locked".into()),
         ));
+        rust_i18n::set_locale("de");
         assert!(db_error(&busy).contains("gerade belegt"));
         assert_eq!(
             db_error(&anyhow::anyhow!("Bitte einen Namen eingeben")),
@@ -3030,5 +3274,215 @@ mod theme_tests {
             schlecht.join("\n")
         );
         assert_eq!(theme_options().len(), Theme::ALL.len() + 1);
+    }
+}
+
+#[cfg(test)]
+mod keyboard_tests {
+    use super::*;
+    use keyboard::key::Named;
+
+    fn press(named: Named, modifiers: keyboard::Modifiers) -> Event {
+        let key = keyboard::Key::Named(named);
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        })
+    }
+
+    fn map(named: Named, modifiers: keyboard::Modifiers, status: event::Status) -> Option<Message> {
+        map_key(press(named, modifiers), status, iced::window::Id::unique())
+    }
+
+    #[test]
+    fn funktionstasten_suche_und_tabs() {
+        let none = keyboard::Modifiers::empty();
+        for key in [Named::Select] {
+            for status in [event::Status::Ignored, event::Status::Captured] {
+                assert!(
+                    matches!(map(key, none, status), Some(Message::FocusSearch)),
+                    "{key:?}"
+                );
+            }
+        }
+        // F1–F6: Tabs in der Reihenfolge der Sidebar
+        let expected = [
+            (Named::F1, View::Music),
+            (Named::F2, View::Compilations),
+            (Named::F3, View::Playlists),
+            (Named::F4, View::MusicBrainz),
+            (Named::F5, View::Settings),
+            (Named::F6, View::Help),
+        ];
+        for (key, view) in expected {
+            match map(key, none, event::Status::Ignored) {
+                Some(Message::ShowViewKey(v)) => assert_eq!(v, view, "{key:?}"),
+                other => panic!("{key:?}: {other:?}"),
+            }
+        }
+        // andere Funktionstasten bleiben frei
+        for key in [Named::F8, Named::F9, Named::F12] {
+            assert!(map(key, none, event::Status::Ignored).is_none(), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn tab_und_umschalt_tab() {
+        assert!(matches!(
+            map(
+                Named::Tab,
+                keyboard::Modifiers::empty(),
+                event::Status::Ignored
+            ),
+            Some(Message::TabPressed(false))
+        ));
+        assert!(matches!(
+            map(
+                Named::Tab,
+                keyboard::Modifiers::SHIFT,
+                event::Status::Ignored
+            ),
+            Some(Message::TabPressed(true))
+        ));
+    }
+
+    #[test]
+    fn step_index_ohne_umbruch() {
+        assert_eq!(step_index(0, None, true), None);
+        assert_eq!(step_index(3, None, true), Some(0));
+        assert_eq!(step_index(3, None, false), Some(2));
+        assert_eq!(step_index(3, Some(0), true), Some(1));
+        assert_eq!(
+            step_index(3, Some(2), true),
+            Some(2),
+            "Ende: stehen bleiben"
+        );
+        assert_eq!(
+            step_index(3, Some(0), false),
+            Some(0),
+            "Anfang: stehen bleiben"
+        );
+        assert_eq!(step_index(3, Some(2), false), Some(1));
+        assert_eq!(step_index(1, Some(0), true), Some(0));
+    }
+
+    /// Test-App mit Temp-DB: Künstler Alpha/Beta/Gamma (+ „Compilations“ mit zwei Alben).
+    fn test_app(name: &str) -> (PlayerApp, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("fya-keys-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("library.db");
+        drop(Library::open(&db_path).unwrap()); // Schema anlegen
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO artists(id,name,sort_name,path) VALUES
+                   (1,'Alpha','alpha','/a'),(2,'Beta','beta','/b'),(3,'Gamma','gamma','/c'),(4,'Compilations','zzz','/x');
+                 INSERT INTO albums(id,artist_id,title,path) VALUES
+                   (10,1,'A1','/a/1'),(20,2,'B1','/b/1'),(30,3,'C1','/c/1'),(40,4,'S1','/x/1'),(41,4,'S2','/x/2');
+                 INSERT INTO tracks(id,album_id,path,format,title,artist_tag) VALUES
+                   (100,10,'/a/1/a.mp3','mp3','a','Alpha'),(200,20,'/b/1/b.mp3','mp3','b','Beta'),
+                   (300,30,'/c/1/c.mp3','mp3','c','Gamma'),(400,40,'/x/1/s.mp3','mp3','s1','Beta'),
+                   (410,41,'/x/2/s.mp3','mp3','s2','Gamma');",
+            )
+            .unwrap();
+        }
+        let library = Library::open(&db_path).unwrap();
+        let (mut app, _task) = PlayerApp::new(library, Audio::new(), db_path);
+        app.reload_library_view(); // Phase::Ready, erster Künstler gewählt
+        (app, dir)
+    }
+
+    #[test]
+    fn tab_wandert_durch_kuenstler_in_music() {
+        let (mut app, dir) = test_app("music");
+        assert_eq!(app.view, View::Music);
+        assert_eq!(
+            app.artists.len(),
+            3,
+            "Compilations steht nicht in der Liste"
+        );
+        assert_eq!(app.selected_artist, Some(1));
+        let _ = app.update(Message::TabPressed(false));
+        assert_eq!(app.selected_artist, Some(2));
+        let _ = app.update(Message::TabPressed(false));
+        assert_eq!(app.selected_artist, Some(3));
+        let _ = app.update(Message::TabPressed(false));
+        assert_eq!(app.selected_artist, Some(3), "Ende: stehen bleiben");
+        let _ = app.update(Message::TabPressed(true));
+        assert_eq!(app.selected_artist, Some(2));
+        // die Titel folgen dem Künstler (eigene + Sampler-Titel des Künstlers)
+        let titles: Vec<_> = app.tracks.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["b", "s1"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tab_wandert_durch_alben_in_compilations() {
+        let (mut app, dir) = test_app("comp");
+        let _ = app.update(Message::ShowViewKey(View::Compilations));
+        assert_eq!(app.view, View::Compilations);
+        assert_eq!(app.comp_selected_album, None, "Alle Alben");
+        for expected in [Some(40), Some(41), Some(41)] {
+            let _ = app.update(Message::TabPressed(false));
+            assert_eq!(app.comp_selected_album, expected);
+        }
+        for expected in [Some(40), None, None] {
+            let _ = app.update(Message::TabPressed(true));
+            assert_eq!(app.comp_selected_album, expected);
+        }
+        // Titel passen zur Auswahl
+        let _ = app.update(Message::TabPressed(false));
+        assert_eq!(app.comp_tracks.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tab_in_anderen_ansichten_aendert_nichts() {
+        let (mut app, dir) = test_app("other");
+        let _ = app.update(Message::ShowViewKey(View::Settings));
+        assert_eq!(app.view, View::Settings);
+        let before = (app.selected_artist, app.comp_selected_album);
+        let _ = app.update(Message::TabPressed(false));
+        assert_eq!((app.selected_artist, app.comp_selected_album), before);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tasten_werden_bei_offenem_dialog_ignoriert() {
+        let (mut app, dir) = test_app("modal");
+        app.playlist_dialog = Some(PlaylistDialog::New {
+            name: String::new(),
+            add: None,
+            error: None,
+        });
+        let _ = app.update(Message::ShowViewKey(View::Help));
+        assert_eq!(
+            app.view,
+            View::Music,
+            "Tab-Wechsel hinter dem Dialog ist gesperrt"
+        );
+        assert_eq!(
+            app.update(Message::FocusSearch).units(),
+            0,
+            "Suche bleibt unberührt"
+        );
+        // Tab gehört dann dem Dialog (Feld-Fokus), nicht der Künstlerliste
+        let selected = app.selected_artist;
+        let _ = app.update(Message::TabPressed(false));
+        assert_eq!(app.selected_artist, selected);
+
+        // ohne Dialog fokussiert F1 das Suchfeld und F-Tasten wechseln
+        app.playlist_dialog = None;
+        assert!(app.update(Message::FocusSearch).units() > 0);
+        let _ = app.update(Message::ShowViewKey(View::Help));
+        assert_eq!(app.view, View::Help);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

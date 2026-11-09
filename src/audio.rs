@@ -2,6 +2,7 @@
 //! Opus wird über ogg + libopus dekodiert und als rodio-Source eingespeist.
 
 use anyhow::{Result, anyhow, bail};
+use rust_i18n::t;
 use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::source::SeekError;
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
@@ -107,7 +108,7 @@ where
             }
         }
     }
-    Err(first_err.context(format!("Ausgabegerät „{name}“ lässt sich nicht öffnen")))
+    Err(first_err.context(t!("audio.open_failed", name = name)))
 }
 
 /// Systemstandard eines Hosts; ist er nicht nutzbar, werden – wie in rodios
@@ -125,7 +126,7 @@ where
             Ok(sink) => return Ok((sink, device_name(device))),
             Err(e) => e,
         },
-        None => anyhow!("Kein Standard-Ausgabegerät gefunden"),
+        None => anyhow!(t!("audio.no_default")),
     };
     log::warn!(
         "{}: Systemstandard nicht nutzbar ({first_err:#}); probiere andere Ausgabegeräte",
@@ -191,7 +192,7 @@ fn open_stream(
                 return Ok((sink, device_name(&device)));
             }
         }
-        bail!("Ausgabegerät „{name}“ nicht gefunden");
+        bail!(t!("audio.not_found", name = name));
     }
 
     // Systemstandard: Host für Host
@@ -209,8 +210,8 @@ fn open_stream(
         }
     }
     Err(first_err
-        .unwrap_or_else(|| anyhow!("Kein Ausgabegerät gefunden"))
-        .context("Kein Ausgabegerät nutzbar"))
+        .unwrap_or_else(|| anyhow!(t!("audio.none_found")))
+        .context(t!("audio.none_usable")))
 }
 
 /// Geöffneter Ausgabestrom samt Player.
@@ -253,7 +254,7 @@ impl Audio {
             }
             Err(e) => {
                 log::error!("Kein Ausgabegerät nutzbar: {e:#}");
-                (None, None, Some(format!("Kein Ausgabegerät nutzbar: {e:#}")))
+                (None, None, Some(t!("audio.none_usable_err", e = format!("{e:#}")).to_string()))
             }
         };
         Self {
@@ -348,7 +349,7 @@ impl Audio {
 
     pub fn play(&mut self, path: &Path) -> Result<()> {
         let Some(out) = &self.out else {
-            bail!("Kein Ausgabegerät verfügbar – bitte im Player (Lautsprecher-Knopf) eines wählen");
+            bail!(t!("audio.unavailable"));
         };
         let ext = path
             .extension()
@@ -475,7 +476,7 @@ impl Audio {
             return Ok(());
         };
         sink.try_seek(pos)
-            .map_err(|e| anyhow::anyhow!("Spulen nicht möglich: {e:?}"))
+            .map_err(|e| anyhow::anyhow!(t!("audio.seek_failed", e = format!("{e:?}"))))
     }
 
     pub fn volume(&self) -> f32 {
@@ -526,14 +527,14 @@ impl OpusSource {
 
         let head = reader.read_packet_expected()?;
         if head.data.len() < 19 || &head.data[..8] != b"OpusHead" {
-            bail!("keine gültige Opus-Datei: {}", path.display());
+            bail!(t!("audio.invalid_opus", path = path.display()));
         }
         let channels = head.data[9] as u16;
         let pre_skip = u16::from_le_bytes([head.data[10], head.data[11]]) as usize;
         let _tags = reader.read_packet_expected()?; // OpusTags
 
         if !matches!(channels, 1 | 2) {
-            bail!("Opus mit {channels} Kanälen wird nicht unterstützt");
+            bail!(t!("audio.opus_channels", channels = channels));
         }
         let decoder = new_decoder(channels)?;
 
@@ -629,7 +630,7 @@ impl Source for OpusSource {
 
 fn new_decoder(channels: u16) -> Result<opus_rs::OpusDecoder> {
     opus_rs::OpusDecoder::new(48_000, channels as usize)
-        .map_err(|e| anyhow::anyhow!("Opus-Decoder: {e}"))
+        .map_err(|e| anyhow::anyhow!(t!("audio.opus_decoder", e = e)))
 }
 
 /// Gesamtlänge eines Opus-Pakets in Samples pro Kanal bei 48 kHz,
@@ -854,6 +855,7 @@ mod tests {
         assert_eq!(audio.take_startup_error().as_deref(), Some("Kein Ausgabegerät nutzbar: Test"));
         assert_eq!(audio.take_startup_error(), None, "einmalig");
 
+        rust_i18n::set_locale("de"); // die Meldung wird übersetzt
         let err = audio.play(Path::new("/gibt/es/nicht.mp3")).unwrap_err();
         assert!(err.to_string().contains("Kein Ausgabegerät"), "{err}");
         audio.toggle_pause();

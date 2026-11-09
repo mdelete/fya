@@ -1,6 +1,7 @@
 //! SQLite-Mediendatenbank: Schema, Scan der Ordnerstruktur, Abfragen.
 
 use anyhow::{Context, Result, bail};
+use rust_i18n::t;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -164,10 +165,10 @@ pub struct MusicRoot {
 /// Rückgabe: Anzahl der Titel.
 pub fn rebuild_from(db_path: &Path, root: &Path) -> Result<usize> {
     if !root.is_dir() {
-        bail!("Musikordner nicht gefunden: {}", root.display());
+        bail!(t!("db.root_not_found", path = root.display()));
     }
     let mut conn = Connection::open(db_path)
-        .with_context(|| format!("Datenbank öffnen: {}", db_path.display()))?;
+        .with_context(|| t!("db.open", path = db_path.display()))?;
     conn.pragma_update(None, "foreign_keys", true)?;
     let n = scan(&mut conn, root)?;
     // IDs aus musicbrainz.db zurückspielen (die Datei selbst bleibt unangetastet).
@@ -269,7 +270,7 @@ impl Library {
             fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(db_path)
-            .with_context(|| format!("Datenbank öffnen: {}", db_path.display()))?;
+            .with_context(|| t!("db.open", path = db_path.display()))?;
         // Kurze Wartezeit: Hält ein Hintergrund-Thread (MusicBrainz, Scan) die Schreibsperre,
         // soll die Oberfläche nicht lange hängen, sondern schnell eine Meldung zeigen.
         conn.busy_timeout(std::time::Duration::from_millis(750))?;
@@ -475,7 +476,7 @@ impl Library {
     pub fn create_playlist(&self, name: &str) -> Result<i64> {
         let name = name.trim();
         if name.is_empty() {
-            bail!("Bitte einen Namen eingeben");
+            bail!(t!("db.name_required"));
         }
         let exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM playlists WHERE name = ?1 COLLATE NOCASE)",
@@ -483,7 +484,7 @@ impl Library {
             |r| r.get(0),
         )?;
         if exists {
-            bail!("Eine Playlist „{name}“ gibt es schon");
+            bail!(t!("db.playlist_exists", name = name));
         }
         self.conn
             .execute("INSERT INTO playlists(name) VALUES (?1)", [name])?;
@@ -494,7 +495,7 @@ impl Library {
     pub fn rename_playlist(&self, id: i64, name: &str) -> Result<()> {
         let name = name.trim();
         if name.is_empty() {
-            bail!("Bitte einen Namen eingeben");
+            bail!(t!("db.name_required"));
         }
         let exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM playlists WHERE name = ?1 COLLATE NOCASE AND id <> ?2)",
@@ -502,7 +503,7 @@ impl Library {
             |r| r.get(0),
         )?;
         if exists {
-            bail!("Eine Playlist „{name}“ gibt es schon");
+            bail!(t!("db.playlist_exists", name = name));
         }
         self.conn.execute(
             "UPDATE playlists SET name = ?1 WHERE id = ?2",
@@ -786,7 +787,7 @@ pub fn write_tags(path: &Path, artist: &str, album: Option<&str>, title: &str) -
     }
     let tag = match tagged.primary_tag_mut() {
         Some(t) => t,
-        None => tagged.first_tag_mut().context("kein Tag-Container")?,
+        None => tagged.first_tag_mut().context(t!("db.no_tag_container"))?,
     };
     tag.set_artist(artist.to_string());
     if let Some(album) = album {
@@ -841,7 +842,7 @@ fn clean_text<S: AsRef<str>>(value: Option<S>) -> Option<String> {
 
 fn sorted_entries(dir: &Path, keep: impl Fn(&Path) -> bool) -> Result<Vec<PathBuf>> {
     let mut v: Vec<PathBuf> = fs::read_dir(dir)
-        .with_context(|| format!("Verzeichnis lesen: {}", dir.display()))?
+        .with_context(|| t!("db.read_dir", path = dir.display()))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         // versteckte Einträge (".DS_Store", "._foo.mp3" …) ignorieren
@@ -989,7 +990,7 @@ pub fn search(
     let hit = |s: &str| s.to_lowercase().contains(&q);
 
     let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("Datenbank öffnen: {}", db_path.display()))?;
+        .with_context(|| t!("db.open", path = db_path.display()))?;
     let mut st = conn.prepare(
         "SELECT ar.id, ar.name, al.id, al.title, t.id, t.title, t.artist_tag, t.album_tag
          FROM albums al
@@ -1109,7 +1110,7 @@ pub fn parse_bpm_query(query: &str) -> Option<(u32, u32)> {
 /// einem Worker-Thread.
 pub fn search_bpm(db_path: &Path, lo: u32, hi: u32) -> Result<SearchHits> {
     let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("Datenbank öffnen: {}", db_path.display()))?;
+        .with_context(|| t!("db.open", path = db_path.display()))?;
     let artist_names: std::collections::HashMap<i64, String> = conn
         .prepare("SELECT id, name FROM artists")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -1201,9 +1202,9 @@ fn parse_bpm(s: &str) -> Result<Option<f32>> {
     let v: f32 = t
         .replace(',', ".")
         .parse()
-        .map_err(|_| anyhow::anyhow!("BPM: „{t}“ ist keine Zahl"))?;
+        .map_err(|_| anyhow::anyhow!(t!("db.bpm_nan", v = t)))?;
     if !v.is_finite() || v <= 0.0 || v > 999.0 {
-        bail!("BPM: „{t}“ ist ungültig (größer 0, höchstens 999)");
+        bail!(t!("db.bpm_range", v = t));
     }
     Ok(Some(v))
 }
@@ -1214,7 +1215,7 @@ fn parse_num(label: &str, s: &str) -> Result<Option<u32>> {
         t => t
             .parse::<u32>()
             .map(Some)
-            .map_err(|_| anyhow::anyhow!("{label}: „{t}“ ist keine Zahl")),
+            .map_err(|_| anyhow::anyhow!(t!("db.nan", label = label, v = t))),
     }
 }
 
@@ -1257,12 +1258,12 @@ pub fn read_tag_edit(path: &Path) -> Result<TagEdit> {
 impl TagEdit {
     /// Prüft die Zahlenfelder (vor dem Schreiben).
     pub fn validate(&self) -> Result<()> {
-        parse_num("Track", &self.track_no)?;
-        parse_num("Track gesamt", &self.track_total)?;
-        parse_num("Disc", &self.disc_no)?;
-        if let Some(y) = parse_num("Jahr", &self.year)? {
+        parse_num(&t!("db.field.track"), &self.track_no)?;
+        parse_num(&t!("db.field.track_total"), &self.track_total)?;
+        parse_num(&t!("db.field.disc"), &self.disc_no)?;
+        if let Some(y) = parse_num(&t!("db.field.year"), &self.year)? {
             if !(1..=9999).contains(&y) {
-                bail!("Jahr: „{y}“ ist ungültig (1–9999)");
+                bail!(t!("db.year_range", v = y));
             }
         }
         parse_bpm(&self.bpm)?;
@@ -1281,7 +1282,7 @@ pub fn write_tag_edit(path: &Path, e: &TagEdit) -> Result<()> {
     }
     let tag = match tagged.primary_tag_mut() {
         Some(t) => t,
-        None => tagged.first_tag_mut().context("kein Tag-Container")?,
+        None => tagged.first_tag_mut().context(t!("db.no_tag_container"))?,
     };
 
     match opt(&e.title) {
@@ -1311,24 +1312,24 @@ pub fn write_tag_edit(path: &Path, e: &TagEdit) -> Result<()> {
             None => tag.remove_key(key),
         }
     }
-    match parse_num("Track", &e.track_no)? {
+    match parse_num(&t!("db.field.track"), &e.track_no)? {
         Some(v) => tag.set_track(v),
         None => tag.remove_track(),
     }
-    match parse_num("Track gesamt", &e.track_total)? {
+    match parse_num(&t!("db.field.track_total"), &e.track_total)? {
         Some(v) => tag.set_track_total(v),
         None => tag.remove_track_total(),
     }
-    match parse_num("Disc", &e.disc_no)? {
+    match parse_num(&t!("db.field.disc"), &e.disc_no)? {
         Some(v) => tag.set_disk(v),
         None => tag.remove_disk(),
     }
-    match parse_num("Jahr", &e.year)? {
+    match parse_num(&t!("db.field.year"), &e.year)? {
         Some(v) => {
             // Nur das Jahr ersetzen; Monat/Tag eines vorhandenen Datums bleiben erhalten
             let year = u16::try_from(v).ok().filter(|y| (1..=9999).contains(y));
             let Some(year) = year else {
-                bail!("Jahr: „{v}“ ist ungültig (1–9999)");
+                bail!(t!("db.year_range", v = v));
             };
             let mut date = tag.date().unwrap_or_default();
             date.year = year;
@@ -1373,11 +1374,11 @@ impl Library {
                 opt(&e.album),
                 opt(&e.album_artist),
                 opt(&e.composer),
-                parse_num("Track", &e.track_no)?,
-                parse_num("Track gesamt", &e.track_total)?,
+                parse_num(&t!("db.field.track"), &e.track_no)?,
+                parse_num(&t!("db.field.track_total"), &e.track_total)?,
                 e.compilation,
-                parse_num("Disc", &e.disc_no)?.unwrap_or(1),
-                parse_num("Jahr", &e.year)?,
+                parse_num(&t!("db.field.disc"), &e.disc_no)?.unwrap_or(1),
+                parse_num(&t!("db.field.year"), &e.year)?,
                 parse_bpm(&e.bpm)?.map(|v| v.round() as i64),
                 id
             ],

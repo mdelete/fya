@@ -27,7 +27,13 @@ serde_json = "1.0.154"
 log = "0.4.35"
 env_logger = "0.11.11"
 zip = { version = "9.4.1", default-features = false }
+rust-i18n = "4"
+sys-locale = "0.3"
 bpm-analyzer = { git = "https://github.com/mdelete/bpm-analyzer", optional = true }
+
+[package.metadata.i18n]
+available-locales = ["de", "en"]
+default-locale = "en"
 
 [features]
 default = ["bpm"]

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
+use rust_i18n::t;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -160,7 +161,7 @@ impl TempDir {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let dir = std::env::temp_dir().join(format!("fya-mixtape-{}-{nanos}", std::process::id()));
-        fs::create_dir_all(&dir).with_context(|| format!("Temp-Ordner: {}", dir.display()))?;
+        fs::create_dir_all(&dir).with_context(|| t!("mixtape.temp_dir", path = dir.display()))?;
         Ok(TempDir(dir))
     }
 }
@@ -178,7 +179,7 @@ fn write_zip(
     convert: Option<&Convert>,
 ) -> Result<(usize, usize, usize)> {
     let file =
-        File::create(target).with_context(|| format!("ZIP anlegen: {}", target.display()))?;
+        File::create(target).with_context(|| t!("mixtape.zip_create", path = target.display()))?;
     let mut zip = ZipWriter::new(file);
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Stored)
@@ -209,7 +210,7 @@ fn write_zip(
         let (source, entry_name, is_temp) = match (convert, &tmp) {
             (Some(c), Some(tmp)) if !c.format.matches_ext(&ext) => {
                 let out = convert_copy(c, &tmp.0, path, idx)
-                    .with_context(|| format!("Konvertieren: {orig_name}"))?;
+                    .with_context(|| t!("mixtape.convert", name = orig_name))?;
                 let stem = Path::new(&orig_name)
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
@@ -221,11 +222,11 @@ fn write_zip(
         };
 
         let mut src = File::open(&source)
-            .with_context(|| format!("Lesen: {}", source.display()))?;
+            .with_context(|| t!("mixtape.read", path = source.display()))?;
         let name = unique_name(&entry_name, &mut used);
         zip.start_file(format!("{folder}/{name}"), options)?;
         io::copy(&mut src, &mut zip)
-            .with_context(|| format!("Kopieren: {}", source.display()))?;
+            .with_context(|| t!("mixtape.copy", path = source.display()))?;
         written += 1;
         if is_temp {
             let _ = fs::remove_file(&source); // Platz sparen, nur die Temp-Ausgabe
@@ -248,12 +249,12 @@ fn convert_copy(c: &Convert, tmp: &Path, src: &Path, idx: usize) -> Result<PathB
 
     // Sicherheitsnetz: Eingabe und Ausgabe liegen im Temp-Ordner, nie beim Original.
     if !input.starts_with(tmp) || !output.starts_with(tmp) || input == src || output == src {
-        bail!("interner Fehler: Temp-Pfad ungültig");
+        bail!(t!("mixtape.internal_tmp"));
     }
-    fs::copy(src, &input).with_context(|| format!("Kopie anlegen: {}", src.display()))?;
+    fs::copy(src, &input).with_context(|| t!("mixtape.copy_create", path = src.display()))?;
     if let (Ok(a), Ok(b)) = (fs::canonicalize(src), fs::canonicalize(&input)) {
         if a == b {
-            bail!("interner Fehler: Kopie zeigt auf das Original");
+            bail!(t!("mixtape.internal_copy"));
         }
     }
 
@@ -276,7 +277,7 @@ fn convert_copy(c: &Convert, tmp: &Path, src: &Path, idx: usize) -> Result<PathB
         }
         let out = cmd
             .output()
-            .with_context(|| format!("ffmpeg starten: {}", c.ffmpeg.display()))?;
+            .with_context(|| t!("mixtape.ffmpeg_start", path = c.ffmpeg.display()))?;
         if out.status.success() && output.is_file() {
             let _ = fs::remove_file(&input); // Eingabekopie sofort löschen
             return Ok(output);
@@ -284,8 +285,8 @@ fn convert_copy(c: &Convert, tmp: &Path, src: &Path, idx: usize) -> Result<PathB
         last_err = String::from_utf8_lossy(&out.stderr)
             .lines()
             .last()
-            .unwrap_or("unbekannter Fehler")
-            .to_string();
+            .map(str::to_string)
+            .unwrap_or_else(|| t!("mixtape.unknown_error").to_string());
     }
     let _ = fs::remove_file(&input);
     bail!("ffmpeg: {last_err}")

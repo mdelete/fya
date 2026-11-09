@@ -8,6 +8,7 @@
 //! neu angelegt oder gelöscht (auch nicht beim erneuten Einlesen des Musikordners)
 //! und dient als Gedächtnis: nach einem Scan werden die IDs daraus zurückgespielt.
 
+use rust_i18n::t;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -44,7 +45,7 @@ pub fn store_path(library_db: &Path) -> PathBuf {
 /// Öffnet `musicbrainz.db`; nur fehlende Tabellen werden angelegt.
 fn open_store(path: &Path) -> Result<Connection> {
     let conn =
-        Connection::open(path).with_context(|| format!("Datenbank öffnen: {}", path.display()))?;
+        Connection::open(path).with_context(|| t!("db.open", path = path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch(MB_SCHEMA)?;
     Ok(conn)
@@ -101,7 +102,7 @@ pub fn lookup_missing(
     progress: &Progress,
 ) -> Result<(usize, usize, usize)> {
     let lib = Connection::open(db_path)
-        .with_context(|| format!("Datenbank öffnen: {}", db_path.display()))?;
+        .with_context(|| t!("db.open", path = db_path.display()))?;
     lib.busy_timeout(Duration::from_secs(5))?;
     let store = open_store(&store_path(db_path))?;
 
