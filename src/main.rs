@@ -7,6 +7,8 @@ mod bpm;
 mod db;
 mod folder;
 mod lang;
+#[cfg(feature = "controls")]
+mod media_controls;
 mod mixtape;
 mod musicbrainz;
 
@@ -290,6 +292,14 @@ fn panel_style(_: &Theme) -> container::Style {
 
 #[derive(Debug, Clone)]
 enum Message {
+    /// Medientaste / Now-Playing-Befehl des Betriebssystems
+    #[cfg(feature = "controls")]
+    Media(media_controls::Command),
+    /// Windows: ein Fensterereignis (Fenster ist offen) -> Fensterhandle für die Medientasten holen
+    #[cfg(all(feature = "controls", windows))]
+    WindowEvent(iced::window::Id),
+    #[cfg(all(feature = "controls", windows))]
+    WindowHandle(Option<isize>),
     SelectArtist(i64),
     FocusSearch,
     /// F1–F6: Tab wechseln (wird bei offenem Dialog/Popover ignoriert)
@@ -532,6 +542,12 @@ struct PlayerApp {
     queue_index: Option<usize>,
     /// Cover des laufenden Titels (falls in der Datei eingebettet)
     cover: Option<image::Handle>,
+    /// Medientasten + „Now Playing“ des Systems (Feature `controls`)
+    #[cfg(feature = "controls")]
+    controls: Option<media_controls::Controls>,
+    /// Windows: Fensterhandle wurde schon angefordert
+    #[cfg(all(feature = "controls", windows))]
+    controls_tried: bool,
     seek_preview: Option<f32>,
     status: Option<String>,
 }
@@ -734,6 +750,12 @@ impl PlayerApp {
             queue: Vec::new(),
             queue_index: None,
             cover: None,
+            #[cfg(all(feature = "controls", not(windows)))]
+            controls: media_controls::Controls::new(()),
+            #[cfg(all(feature = "controls", windows))]
+            controls: None,
+            #[cfg(all(feature = "controls", windows))]
+            controls_tried: false,
             seek_preview: None,
             status: None,
         };
@@ -940,11 +962,47 @@ impl PlayerApp {
             Subscription::none()
         };
 
-        Subscription::batch([ticker, keys, spinner])
+        #[cfg_attr(not(feature = "controls"), allow(unused_mut))]
+        let mut subscriptions = vec![ticker, keys, spinner];
+
+        // Befehle des Betriebssystems (Medientasten …)
+        #[cfg(feature = "controls")]
+        subscriptions.push(Subscription::run(media_controls::commands).map(Message::Media));
+
+        // Windows braucht für die Medientasten das Fenster: erstes Fensterereignis abwarten
+        #[cfg(all(feature = "controls", windows))]
+        if self.controls.is_none() && !self.controls_tried {
+            subscriptions.push(event::listen_with(|event, _status, id| {
+                matches!(event, Event::Window(_)).then_some(Message::WindowEvent(id))
+            }));
+        }
+
+        Subscription::batch(subscriptions)
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.update_state(message);
+        #[cfg(feature = "controls")]
+        self.sync_media_controls();
+        task
+    }
+
+    fn update_state(&mut self, message: Message) -> Task<Message> {
         match message {
+            #[cfg(feature = "controls")]
+            Message::Media(cmd) => self.media_command(cmd),
+            #[cfg(all(feature = "controls", windows))]
+            Message::WindowEvent(id) => {
+                if !self.controls_tried {
+                    self.controls_tried = true;
+                    return iced::window::run(id, media_controls::window_handle)
+                        .map(Message::WindowHandle);
+                }
+            }
+            #[cfg(all(feature = "controls", windows))]
+            Message::WindowHandle(handle) => {
+                self.controls = handle.and_then(media_controls::Controls::new);
+            }
             Message::SelectArtist(id) => {
                 self.load_artist(id);
                 return Task::batch([self.cover_task(), snap_top(ALBUMS_PANE)]);
@@ -1923,6 +1981,94 @@ impl PlayerApp {
                 self.play_at(i - 1);
             }
         }
+    }
+}
+
+#[cfg(feature = "controls")]
+impl PlayerApp {
+    /// Befehl des Betriebssystems (Medientaste, Sperrbildschirm, `playerctl` …).
+    fn media_command(&mut self, cmd: media_controls::Command) {
+        use media_controls::Command;
+        match cmd {
+            Command::Play if !self.audio.is_playing() => self.toggle_pause(),
+            Command::Pause if self.audio.is_playing() => self.audio.toggle_pause(),
+            Command::Play | Command::Pause => {}
+            Command::Toggle => self.toggle_pause(),
+            Command::Next => self.next(),
+            Command::Previous => self.previous(),
+            Command::Stop => self.stop_playback(),
+            Command::SeekTo(pos) => self.seek_to(pos),
+            Command::SeekBy { forward, by } => {
+                let pos = self.audio.position();
+                self.seek_to(if forward {
+                    pos + by
+                } else {
+                    pos.saturating_sub(by)
+                });
+            }
+        }
+    }
+
+    fn seek_to(&mut self, pos: Duration) {
+        let Some(track) = self.current_track() else {
+            return;
+        };
+        let pos = pos.min(Duration::from_secs(u64::from(track.duration_secs)));
+        if let Err(e) = self.audio.seek(pos) {
+            self.status = Some(e.to_string());
+        }
+    }
+
+    /// Titel und Status an Medientasten/„Now Playing“ des Systems melden.
+    fn sync_media_controls(&mut self) {
+        let Some(mut controls) = self.controls.take() else {
+            return;
+        };
+        let playback = match (self.audio.is_active(), self.audio.is_playing()) {
+            (false, _) => media_controls::Playback::Stopped,
+            (true, true) => media_controls::Playback::Playing,
+            (true, false) => media_controls::Playback::Paused,
+        };
+        let track = self.current_track();
+        controls.sync(
+            track.map(|t| t.id),
+            || {
+                let t = track.expect("Titel vorhanden, wenn die ID gesetzt ist");
+                let (artist, album) = self.track_artist_album(t);
+                media_controls::NowPlaying {
+                    title: t.title.clone(),
+                    artist: artist.to_string(),
+                    album: album.to_string(),
+                    duration: Duration::from_secs(u64::from(t.duration_secs)),
+                    cover: match &self.cover {
+                        Some(image::Handle::Bytes(_, bytes)) => Some(bytes.to_vec()),
+                        _ => None,
+                    },
+                }
+            },
+            playback,
+            self.audio.position(),
+        );
+        self.controls = Some(controls);
+    }
+}
+
+impl PlayerApp {
+    /// Anzeigenamen aus den Tags statt der (bereinigten) Ordnernamen. Sammler-Ordner
+    /// „Compilations“: Künstler des Titels aus dem Tag.
+    fn track_artist_album<'a>(&'a self, t: &'a Track) -> (&'a str, &'a str) {
+        let artist = match (&t.artist_tag, t.artist_name == COMPILATIONS) {
+            (Some(tag), true) => tag,
+            _ => self
+                .artist_names
+                .get(&t.artist_name)
+                .unwrap_or(&t.artist_name),
+        };
+        let album = self
+            .album_titles
+            .get(&(t.artist_name.clone(), t.album_title.clone()))
+            .unwrap_or(&t.album_title);
+        (artist, album)
     }
 
     fn toggle_pause(&mut self) {
@@ -2915,19 +3061,7 @@ impl PlayerApp {
         let (title, subtitle) = match (&self.status, current) {
             (Some(err), _) => (err.clone(), String::new()),
             (None, Some(t)) => (t.title.clone(), {
-                // Anzeigenamen aus den Tags statt der (bereinigten) Ordnernamen
-                // Sammler-Ordner „Compilations“: Künstler des Titels aus dem Tag
-                let artist = match (&t.artist_tag, t.artist_name == COMPILATIONS) {
-                    (Some(tag), true) => tag,
-                    _ => self
-                        .artist_names
-                        .get(&t.artist_name)
-                        .unwrap_or(&t.artist_name),
-                };
-                let album = self
-                    .album_titles
-                    .get(&(t.artist_name.clone(), t.album_title.clone()))
-                    .unwrap_or(&t.album_title);
+                let (artist, album) = self.track_artist_album(t);
                 format!("{artist} — {album}")
             }),
             (None, None) => (t!("player.no_track").to_string(), String::new()),

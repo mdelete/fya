@@ -30,6 +30,7 @@ zip = { version = "9.4.1", default-features = false }
 rust-i18n = "4"
 sys-locale = "0.3"
 bpm-analyzer = { git = "https://github.com/mdelete/bpm-analyzer", optional = true }
+souvlaki = { git = "https://github.com/Sinono3/souvlaki", branch = "1.0", optional = true }
 
 [package.metadata.i18n]
 available-locales = ["de", "en"]
@@ -38,6 +39,7 @@ default-locale = "en"
 [features]
 default = ["bpm"]
 bpm = ["dep:bpm-analyzer"]
+controls = ["dep:souvlaki"]
 ogg = ["rodio/vorbis", "rodio/flac"]
 
 # macOS: Ordner-Dialog, Bookmarks, Icon, Finder (läuft ohne App Sandbox)
