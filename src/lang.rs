@@ -16,8 +16,14 @@ impl fmt::Display for Lang {
 }
 
 pub const LANGS: &[Lang] = &[
-    Lang { code: "de", name: "Deutsch" },
-    Lang { code: "en", name: "English" },
+    Lang {
+        code: "de",
+        name: "Deutsch",
+    },
+    Lang {
+        code: "en",
+        name: "English",
+    },
 ];
 
 pub const FALLBACK: Lang = LANGS[1];
@@ -60,13 +66,22 @@ mod tests {
             std::fs::read_to_string(path)
                 .unwrap()
                 .lines()
-                .filter_map(|l| l.strip_prefix('"')?.split_once("\": ").map(|(k, _)| k.to_string()))
+                .filter_map(|l| {
+                    l.strip_prefix('"')?
+                        .split_once("\": ")
+                        .map(|(k, _)| k.to_string())
+                })
                 .collect()
         }
         let reference = keys(LANGS[0].code);
         assert!(!reference.is_empty());
         for l in LANGS {
-            assert_eq!(keys(l.code), reference, "Schlüssel in {}.yml weichen ab", l.code);
+            assert_eq!(
+                keys(l.code),
+                reference,
+                "Schlüssel in {}.yml weichen ab",
+                l.code
+            );
         }
     }
 

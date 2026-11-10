@@ -121,12 +121,12 @@ pub fn is_permission_denied(err: &anyhow::Error) -> bool {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use rust_i18n::t;
     use objc2::rc::Retained;
     use objc2::runtime::Bool;
     use objc2_foundation::{
         NSData, NSString, NSURL, NSURLBookmarkCreationOptions, NSURLBookmarkResolutionOptions,
     };
+    use rust_i18n::t;
     use std::path::{Path, PathBuf};
 
     /// Security-scoped URL; beendet den Zugriff beim Drop.

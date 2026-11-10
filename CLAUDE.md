@@ -22,3 +22,4 @@ Code-Kommentare und UI-Texte sind überwiegend deutsch.
 - Bauen/Testen: `cargo build`, `cargo test`. macOS-App-Bundle: `scripts/bundle-macos.sh`.
 - Die macOS-App läuft **ohne** App Sandbox (keine Entitlements), damit sie frei auf den
   Musikordner zugreifen und externe Programme starten kann.
+- Nach Fertigstellung einer Codeänderung immer `cargo fmt` aufrufen.

@@ -1,8 +1,8 @@
 //! SQLite-Mediendatenbank: Schema, Scan der Ordnerstruktur, Abfragen.
 
 use anyhow::{Context, Result, bail};
-use rust_i18n::t;
 use rusqlite::{Connection, OptionalExtension, params};
+use rust_i18n::t;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -167,8 +167,8 @@ pub fn rebuild_from(db_path: &Path, root: &Path) -> Result<usize> {
     if !root.is_dir() {
         bail!(t!("db.root_not_found", path = root.display()));
     }
-    let mut conn = Connection::open(db_path)
-        .with_context(|| t!("db.open", path = db_path.display()))?;
+    let mut conn =
+        Connection::open(db_path).with_context(|| t!("db.open", path = db_path.display()))?;
     conn.pragma_update(None, "foreign_keys", true)?;
     let n = scan(&mut conn, root)?;
     // IDs aus musicbrainz.db zurückspielen (die Datei selbst bleibt unangetastet).
@@ -269,8 +269,8 @@ impl Library {
         if let Some(parent) = db_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(db_path)
-            .with_context(|| t!("db.open", path = db_path.display()))?;
+        let conn =
+            Connection::open(db_path).with_context(|| t!("db.open", path = db_path.display()))?;
         // Kurze Wartezeit: Hält ein Hintergrund-Thread (MusicBrainz, Scan) die Schreibsperre,
         // soll die Oberfläche nicht lange hängen, sondern schnell eine Meldung zeigen.
         conn.busy_timeout(std::time::Duration::from_millis(750))?;
@@ -1070,10 +1070,7 @@ pub fn search(
 
 /// Künstler (ID) zu einem Künstler-Tag: Name gleich (ohne Groß-/Kleinschreibung) oder bis auf
 /// ersetzte Sonderzeichen gleich dem Ordnernamen. „Compilations“ selbst zählt nicht.
-fn find_artist_for_tag(
-    artists: &std::collections::HashMap<i64, String>,
-    tag: &str,
-) -> Option<i64> {
+fn find_artist_for_tag(artists: &std::collections::HashMap<i64, String>, tag: &str) -> Option<i64> {
     artists
         .iter()
         .filter(|(_, name)| name.as_str() != "Compilations")
@@ -1686,10 +1683,24 @@ mod bpm_tag_tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         // (Endung, Codec, Dezimal-BPM bleibt erhalten?)
-        for (ext, codec, decimal) in [("mp3", "libmp3lame", false), ("opus", "libopus", true), ("m4a", "aac", true)] {
+        for (ext, codec, decimal) in [
+            ("mp3", "libmp3lame", false),
+            ("opus", "libopus", true),
+            ("m4a", "aac", true),
+        ] {
             let file = dir.join(format!("t.{ext}"));
             let ok = std::process::Command::new(&ffmpeg)
-                .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1"])
+                .args([
+                    "-nostdin",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=48000:cl=stereo",
+                    "-t",
+                    "1",
+                ])
                 .args(["-metadata", "title=T", "-c:a", codec])
                 .arg(&file)
                 .status()
@@ -1702,7 +1713,11 @@ mod bpm_tag_tests {
             // ganzzahlig
             e.bpm = "128".into();
             write_tag_edit(&file, &e).unwrap();
-            assert_eq!(read_tag_edit(&file).unwrap().bpm, "128", "{ext}: ganzzahlig");
+            assert_eq!(
+                read_tag_edit(&file).unwrap().bpm,
+                "128",
+                "{ext}: ganzzahlig"
+            );
 
             // dezimal (Komma erlaubt): ID3 kennt nur ganze BPM -> gerundet
             e.bpm = "127,6".into();
@@ -1713,10 +1728,17 @@ mod bpm_tag_tests {
             // ungültig: nichts wird geschrieben
             for bad in ["abc", "0", "-5", "1000", "NaN"] {
                 e.bpm = bad.into();
-                assert!(write_tag_edit(&file, &e).is_err(), "{ext}: „{bad}“ muss scheitern");
+                assert!(
+                    write_tag_edit(&file, &e).is_err(),
+                    "{ext}: „{bad}“ muss scheitern"
+                );
                 assert!(e.validate().is_err());
             }
-            assert_eq!(read_tag_edit(&file).unwrap().bpm, expect, "{ext}: unverändert");
+            assert_eq!(
+                read_tag_edit(&file).unwrap().bpm,
+                expect,
+                "{ext}: unverändert"
+            );
 
             // entfernen; andere Tags bleiben
             e.bpm = String::new();
@@ -1753,8 +1775,23 @@ mod bpm_db_tests {
         assert_eq!(parse_bpm_query(":7-9"), Some((7, 9)));
         // nicht interpretiert: nur ganze, höchstens dreistellige Zahlen
         for bad in [
-            "", ":", ":-", ":1000", ":1234", ":12a", ":abc", ":12.5", ":12,5", ":-5", ":5-", ":1-2-3",
-            ":12 - 14", ": 12", "120", "a:120", ":１２０",
+            "",
+            ":",
+            ":-",
+            ":1000",
+            ":1234",
+            ":12a",
+            ":abc",
+            ":12.5",
+            ":12,5",
+            ":-5",
+            ":5-",
+            ":1-2-3",
+            ":12 - 14",
+            ": 12",
+            "120",
+            "a:120",
+            ":１２０",
         ] {
             assert_eq!(parse_bpm_query(bad), None, "{bad:?}");
         }
@@ -1783,7 +1820,11 @@ mod bpm_db_tests {
         let h = search_bpm(&db, 123, 133).unwrap();
         let mut tracks: Vec<_> = h.tracks.iter().copied().collect();
         tracks.sort();
-        assert_eq!(tracks, [100, 200, 201], "nur passende Titel, nicht ganze Alben");
+        assert_eq!(
+            tracks,
+            [100, 200, 201],
+            "nur passende Titel, nicht ganze Alben"
+        );
         assert!(h.albums.contains(&10) && h.albums.contains(&20) && !h.albums.contains(&30));
         // Künstler: Prodigy (eigener Titel + Sampler-Titel per Tag), Compilations (Album)
         assert!(h.artists.contains(&1) && h.artists.contains(&2) && !h.artists.contains(&3));
@@ -1848,7 +1889,17 @@ mod bpm_db_tests {
             ("c.mp3", "libmp3lame", "title=OhneBpm"),
         ] {
             let ok = std::process::Command::new(&ffmpeg)
-                .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1"])
+                .args([
+                    "-nostdin",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=48000:cl=stereo",
+                    "-t",
+                    "1",
+                ])
                 .args(["-metadata", tag, "-c:a", codec])
                 .arg(album.join(name))
                 .status()
@@ -1878,9 +1929,11 @@ mod bpm_db_tests {
         // Tag-Editor: Änderung landet auch in der Datenbank
         let (id, path): (i64, String) = lib
             .conn
-            .query_row("SELECT id, path FROM tracks WHERE path LIKE '%c.mp3'", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT id, path FROM tracks WHERE path LIKE '%c.mp3'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         let mut e = read_tag_edit(Path::new(&path)).unwrap();
         e.bpm = "99,6".into();
@@ -1899,7 +1952,10 @@ mod trim_tests {
 
     #[test]
     fn clean_text_schneidet_leerzeichen_und_nullbytes() {
-        assert_eq!(clean_text(Some("Try Again                     ")).as_deref(), Some("Try Again"));
+        assert_eq!(
+            clean_text(Some("Try Again                     ")).as_deref(),
+            Some("Try Again")
+        );
         assert_eq!(clean_text(Some("  Alb um\0\0 ")).as_deref(), Some("Alb um"));
         assert_eq!(clean_text(Some("a  b")).as_deref(), Some("a  b")); // innen unverändert
         assert_eq!(clean_text(Some("      ")), None);
@@ -1920,8 +1976,25 @@ mod trim_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("t.mp3");
         let ok = std::process::Command::new(ffmpeg)
-            .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "1"])
-            .args(["-write_id3v2", "0", "-write_id3v1", "0", "-c:a", "libmp3lame"])
+            .args([
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=44100:cl=stereo",
+                "-t",
+                "1",
+            ])
+            .args([
+                "-write_id3v2",
+                "0",
+                "-write_id3v1",
+                "0",
+                "-c:a",
+                "libmp3lame",
+            ])
             .arg(&file)
             .status()
             .unwrap()
@@ -1942,7 +2015,9 @@ mod trim_tests {
         let mut bytes = std::fs::read(&file).unwrap();
         // ffmpeg legt trotzdem einen (leeren) ID3v2-Kopf an: entfernen, damit nur ID3v1 bleibt
         if bytes.starts_with(b"ID3") {
-            let size = bytes[6..10].iter().fold(0usize, |n, b| (n << 7) | usize::from(b & 0x7f));
+            let size = bytes[6..10]
+                .iter()
+                .fold(0usize, |n, b| (n << 7) | usize::from(b & 0x7f));
             bytes.drain(..10 + size);
         }
         bytes.extend_from_slice(&tag);
@@ -1979,14 +2054,32 @@ mod ogg_tests {
         let album = dir.join("musik/Künstler/Album");
         std::fs::create_dir_all(&album).unwrap();
         for (name, args) in [
-            ("a.ogg", &["-c:a", "vorbis", "-strict", "-2", "-f", "ogg"][..]),
+            (
+                "a.ogg",
+                &["-c:a", "vorbis", "-strict", "-2", "-f", "ogg"][..],
+            ),
             ("b.oga", &["-c:a", "flac", "-f", "ogg"][..]),
             ("c.flac", &["-c:a", "flac"][..]),
             ("d.ogg", &["-c:a", "libopus", "-f", "ogg"][..]),
         ] {
             let ok = std::process::Command::new(&ffmpeg)
-                .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1"])
-                .args(["-metadata", &format!("title=T-{name}"), "-metadata", "BPM=128"])
+                .args([
+                    "-nostdin",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=48000:cl=stereo",
+                    "-t",
+                    "1",
+                ])
+                .args([
+                    "-metadata",
+                    &format!("title=T-{name}"),
+                    "-metadata",
+                    "BPM=128",
+                ])
                 .args(args)
                 .arg(album.join(name))
                 .status()
@@ -1996,7 +2089,11 @@ mod ogg_tests {
         }
         let db = dir.join("library.db");
         Library::open(&db).unwrap();
-        assert_eq!(rebuild_from(&db, &dir.join("musik")).unwrap(), 4, "alle vier aufgenommen");
+        assert_eq!(
+            rebuild_from(&db, &dir.join("musik")).unwrap(),
+            4,
+            "alle vier aufgenommen"
+        );
 
         let lib = Library::open(&db).unwrap();
         let rows: Vec<(String, Option<i64>)> = lib
@@ -2022,12 +2119,20 @@ mod ogg_tests {
         for name in ["a.ogg", "c.flac", "d.ogg"] {
             let file = album.join(name);
             let mut e = read_tag_edit(&file).unwrap();
-            assert_eq!((e.title.as_str(), e.bpm.as_str()), (format!("T-{name}").as_str(), "128"), "{name}");
+            assert_eq!(
+                (e.title.as_str(), e.bpm.as_str()),
+                (format!("T-{name}").as_str(), "128"),
+                "{name}"
+            );
             e.title = format!("Neu-{name}");
             e.bpm = "97".into();
             write_tag_edit(&file, &e).unwrap_or_else(|err| panic!("{name}: schreiben: {err:#}"));
             let back = read_tag_edit(&file).unwrap();
-            assert_eq!((back.title.as_str(), back.bpm.as_str()), (format!("Neu-{name}").as_str(), "97"), "{name}");
+            assert_eq!(
+                (back.title.as_str(), back.bpm.as_str()),
+                (format!("Neu-{name}").as_str(), "97"),
+                "{name}"
+            );
         }
         let _ = std::fs::remove_dir_all(dir);
     }

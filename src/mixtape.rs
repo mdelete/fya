@@ -63,7 +63,14 @@ impl Format {
         let mut a = vec!["-map", "0:a:0"];
         let cover = with_cover && self != Format::Opus;
         if cover {
-            a.extend(["-map", "0:v?", "-c:v", "copy", "-disposition:v", "attached_pic"]);
+            a.extend([
+                "-map",
+                "0:v?",
+                "-c:v",
+                "copy",
+                "-disposition:v",
+                "attached_pic",
+            ]);
         } else {
             a.push("-vn");
         }
@@ -97,11 +104,20 @@ pub struct Convert {
 /// Sucht ffmpeg im `PATH` und an üblichen Orten (aus Finder gestartete Apps haben nur
 /// einen minimalen `PATH`, Homebrew liegt dort nicht drin).
 pub fn find_ffmpeg() -> Option<PathBuf> {
-    let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    let name = if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    for extra in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/snap/bin"] {
+    for extra in [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/snap/bin",
+    ] {
         dirs.push(PathBuf::from(extra));
     }
     dirs.into_iter().map(|d| d.join(name)).find(|p| p.is_file())
@@ -126,7 +142,10 @@ pub fn create(
     convert: Option<&Convert>,
 ) -> Result<Outcome> {
     let mut target = target.to_path_buf();
-    if target.extension().is_none_or(|e| !e.eq_ignore_ascii_case("zip")) {
+    if target
+        .extension()
+        .is_none_or(|e| !e.eq_ignore_ascii_case("zip"))
+    {
         let mut name = target.as_os_str().to_os_string();
         name.push(".zip");
         target = PathBuf::from(name);
@@ -221,8 +240,8 @@ fn write_zip(
             _ => (path.clone(), orig_name, false),
         };
 
-        let mut src = File::open(&source)
-            .with_context(|| t!("mixtape.read", path = source.display()))?;
+        let mut src =
+            File::open(&source).with_context(|| t!("mixtape.read", path = source.display()))?;
         let name = unique_name(&entry_name, &mut used);
         zip.start_file(format!("{folder}/{name}"), options)?;
         io::copy(&mut src, &mut zip)
@@ -313,7 +332,8 @@ mod tests {
     use std::io::Read;
 
     fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("fya-mixtape-test-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("fya-mixtape-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -346,7 +366,11 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            ["Road_Trip_ 1/other.m4a", "Road_Trip_ 1/song (2).mp3", "Road_Trip_ 1/song.mp3"]
+            [
+                "Road_Trip_ 1/other.m4a",
+                "Road_Trip_ 1/song (2).mp3",
+                "Road_Trip_ 1/song.mp3"
+            ]
         );
         let mut s = String::new();
         z.by_name("Road_Trip_ 1/song (2).mp3")
@@ -383,8 +407,17 @@ mod tests {
         .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let conv = Convert { ffmpeg: fake, format: Format::Opus };
-        let out = create(&dir.join("t.zip"), "Mix", &[orig.clone(), same_format.clone()], Some(&conv)).unwrap();
+        let conv = Convert {
+            ffmpeg: fake,
+            format: Format::Opus,
+        };
+        let out = create(
+            &dir.join("t.zip"),
+            "Mix",
+            &[orig.clone(), same_format.clone()],
+            Some(&conv),
+        )
+        .unwrap();
         assert_eq!((out.written, out.converted), (2, 1)); // .opus bleibt unkonvertiert
 
         // Original unverändert
@@ -403,10 +436,16 @@ mod tests {
         // ZIP: konvertierte Datei (Endung .opus) + unveränderte .opus
         let mut z = zip::ZipArchive::new(File::open(dir.join("t.zip")).unwrap()).unwrap();
         let mut s = String::new();
-        z.by_name("Mix/song.opus").unwrap().read_to_string(&mut s).unwrap();
+        z.by_name("Mix/song.opus")
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
         assert_eq!(s.trim(), "CONVERTED");
         let mut s = String::new();
-        z.by_name("Mix/schon.opus").unwrap().read_to_string(&mut s).unwrap();
+        z.by_name("Mix/schon.opus")
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
         assert_eq!(s, "OPUSDATA");
         let _ = fs::remove_dir_all(dir);
     }
@@ -419,9 +458,16 @@ mod tests {
         let orig = dir.join("song.mp3");
         fs::write(&orig, b"ORIGINAL").unwrap();
         let fake = dir.join("ffmpeg");
-        fs::write(&fake, "#!/bin/sh\necho 'Unknown encoder libopus' >&2\nexit 1\n").unwrap();
+        fs::write(
+            &fake,
+            "#!/bin/sh\necho 'Unknown encoder libopus' >&2\nexit 1\n",
+        )
+        .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
-        let conv = Convert { ffmpeg: fake, format: Format::Opus };
+        let conv = Convert {
+            ffmpeg: fake,
+            format: Format::Opus,
+        };
         let err = create(&dir.join("t.zip"), "Mix", &[orig.clone()], Some(&conv)).unwrap_err();
         assert!(format!("{err:#}").contains("Unknown encoder libopus"));
         assert!(!dir.join("t.zip").exists());
@@ -439,8 +485,23 @@ mod tests {
         let dir = temp("real");
         let src = dir.join("Song.mp3");
         let made = Command::new(&ffmpeg)
-            .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1"])
-            .args(["-metadata", "title=Testtitel", "-metadata", "artist=Tester", "-c:a", "libmp3lame"])
+            .args([
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+            ])
+            .args([
+                "-metadata",
+                "title=Testtitel",
+                "-metadata",
+                "artist=Tester",
+                "-c:a",
+                "libmp3lame",
+            ])
             .arg(&src)
             .status()
             .unwrap();
@@ -448,7 +509,10 @@ mod tests {
         let before = fs::read(&src).unwrap();
 
         for (fmt, magic) in [(Format::Opus, &b"OggS"[..]), (Format::Aac, &b"ftyp"[..])] {
-            let conv = Convert { ffmpeg: ffmpeg.clone(), format: fmt };
+            let conv = Convert {
+                ffmpeg: ffmpeg.clone(),
+                format: fmt,
+            };
             let zip_path = dir.join(format!("{}.zip", fmt.key()));
             let out = create(&zip_path, "Mix", &[src.clone()], Some(&conv)).unwrap();
             assert_eq!((out.written, out.converted), (1, 1), "{fmt}");
@@ -458,7 +522,10 @@ mod tests {
             let mut bytes = Vec::new();
             z.by_name(&name).unwrap().read_to_end(&mut bytes).unwrap();
             assert!(bytes.len() > 500, "{fmt}: Ausgabe zu klein");
-            assert!(bytes.windows(4).take(64).any(|w| w == magic), "{fmt}: falsches Format");
+            assert!(
+                bytes.windows(4).take(64).any(|w| w == magic),
+                "{fmt}: falsches Format"
+            );
 
             // Tags (Titel/Künstler) sind in der konvertierten Datei angekommen
             let conv_file = dir.join(format!("check.{}", fmt.ext()));

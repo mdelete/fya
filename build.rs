@@ -7,6 +7,7 @@ fn main() {
         res.set_icon("assets/icons/app-icon.ico");
         res.set("ProductName", "FYA");
         res.set("FileDescription", "FYA");
+        res.set("LegalCopyright", "© 2026 Marc Delling");
         if let Err(e) = res.compile() {
             println!("cargo:warning=Windows-Ressourcen nicht eingebettet: {e}");
         }

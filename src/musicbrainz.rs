@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 const ENDPOINT: &str = "https://musicbrainz.org/ws/2/release-group/";
 const USER_AGENT: &str = concat!("fya/", env!("CARGO_PKG_VERSION"), " (local music player)");
@@ -44,8 +44,7 @@ pub fn store_path(library_db: &Path) -> PathBuf {
 
 /// Öffnet `musicbrainz.db`; nur fehlende Tabellen werden angelegt.
 fn open_store(path: &Path) -> Result<Connection> {
-    let conn =
-        Connection::open(path).with_context(|| t!("db.open", path = path.display()))?;
+    let conn = Connection::open(path).with_context(|| t!("db.open", path = path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch(MB_SCHEMA)?;
     Ok(conn)
@@ -93,6 +92,15 @@ struct Album {
     lib_mbid: Option<String>,
 }
 
+/// „Titel EP“ -> „Titel“: MusicBrainz führt EPs als Release-Group „Titel“ (Typ EP),
+/// das Suffix im Tag würde die Suche verfehlen.
+fn strip_ep_suffix(title: &str) -> &str {
+    match title.strip_suffix(" EP") {
+        Some(rest) if !rest.trim().is_empty() => rest.trim_end(),
+        _ => title,
+    }
+}
+
 /// Fragt alle Alben ohne mbid ab. Bricht nach der nächsten abgeschlossenen
 /// Anfrage ab, sobald `cancel` gesetzt ist. Nach jeder erfolgreich ermittelten
 /// MBID werden die zugehörigen Bilder geladen. Rückgabe: (eingetragen, geprüft, Bilder).
@@ -101,8 +109,7 @@ pub fn lookup_missing(
     cancel: &AtomicBool,
     progress: &Progress,
 ) -> Result<(usize, usize, usize)> {
-    let lib = Connection::open(db_path)
-        .with_context(|| t!("db.open", path = db_path.display()))?;
+    let lib = Connection::open(db_path).with_context(|| t!("db.open", path = db_path.display()))?;
     lib.busy_timeout(Duration::from_secs(5))?;
     let store = open_store(&store_path(db_path))?;
 
@@ -129,10 +136,11 @@ pub fn lookup_missing(
         .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
         .map(|mut a| {
-            a.query_title = display
+            let title = display
                 .get(&(a.artist.clone(), a.title.clone()))
                 .cloned()
                 .unwrap_or_else(|| a.title.clone());
+            a.query_title = strip_ep_suffix(&title).to_string();
             a.query_artist = artist_display
                 .get(&a.artist)
                 .cloned()
@@ -151,9 +159,7 @@ pub fn lookup_missing(
     let albums: Vec<Album> = albums
         .into_iter()
         .filter(|a| !never_request(&a.artist, &a.title))
-        .filter(|a| {
-            a.lib_mbid.is_none() || !known.contains(&(a.artist.clone(), a.title.clone()))
-        })
+        .filter(|a| a.lib_mbid.is_none() || !known.contains(&(a.artist.clone(), a.title.clone())))
         .collect();
     progress.current.store(0, Ordering::Relaxed);
     progress.total.store(albums.len(), Ordering::Relaxed);
@@ -355,7 +361,8 @@ pub struct AlbumEntry {
 pub fn list_albums(library_db: &Path) -> Result<Vec<AlbumEntry>> {
     let store = open_store(&store_path(library_db))?;
     store.execute("ATTACH DATABASE ?1 AS lib", [library_db.to_string_lossy()])?;
-    let lib_ro = Connection::open_with_flags(library_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let lib_ro =
+        Connection::open_with_flags(library_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let display = crate::db::album_display_titles(&lib_ro)?;
     let artist_names = crate::db::artist_display_names(&lib_ro)?;
     let mut st = store.prepare(
@@ -376,7 +383,10 @@ pub fn list_albums(library_db: &Path) -> Result<Vec<AlbumEntry>> {
                 .get(&(artist.clone(), album.clone()))
                 .cloned()
                 .unwrap_or_else(|| album.clone()),
-            artist_display: artist_names.get(&artist).cloned().unwrap_or_else(|| artist.clone()),
+            artist_display: artist_names
+                .get(&artist)
+                .cloned()
+                .unwrap_or_else(|| artist.clone()),
             artist,
             album,
             state: match mbid {
@@ -604,11 +614,12 @@ fn ensure_images(
     if never_request(artist, album) {
         return Ok(0);
     }
-    let row = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<Option<(String, Option<Vec<u8>>)>> {
-        Ok(store
-            .query_row(sql, p, |r| Ok((r.get(0)?, r.get(1)?)))
-            .optional()?)
-    };
+    let row =
+        |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<Option<(String, Option<Vec<u8>>)>> {
+            Ok(store
+                .query_row(sql, p, |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?)
+        };
     let mut stored = 0;
 
     if let Some((mbid, None)) = row(
@@ -630,7 +641,10 @@ fn ensure_images(
             }
         }
     }
-    if let Some((mbid, None)) = row("SELECT mbid, image FROM artists WHERE name = ?1", &[&artist])? {
+    if let Some((mbid, None)) = row(
+        "SELECT mbid, image FROM artists WHERE name = ?1",
+        &[&artist],
+    )? {
         if !mbid.is_empty() {
             let blob = match fetch_artist_image(agent, throttle, &mbid) {
                 Fetched::Image(b) => Some(b),
@@ -638,10 +652,27 @@ fn ensure_images(
                 Fetched::Failed => None,
             };
             if let Some(b) = blob {
-                store.execute("UPDATE artists SET image = ?1 WHERE name = ?2", params![b, artist])?;
+                store.execute(
+                    "UPDATE artists SET image = ?1 WHERE name = ?2",
+                    params![b, artist],
+                )?;
                 stored += 1;
             }
         }
     }
     Ok(stored)
+}
+
+#[cfg(test)]
+mod ep_suffix_tests {
+    use super::strip_ep_suffix;
+
+    #[test]
+    fn strips_trailing_ep_only() {
+        assert_eq!(strip_ep_suffix("Warriors EP"), "Warriors");
+        assert_eq!(strip_ep_suffix("Warriors  EP"), "Warriors");
+        assert_eq!(strip_ep_suffix("Deep"), "Deep");
+        assert_eq!(strip_ep_suffix("EP Collection"), "EP Collection");
+        assert_eq!(strip_ep_suffix(" EP"), " EP");
+    }
 }

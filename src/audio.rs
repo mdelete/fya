@@ -2,10 +2,10 @@
 //! Opus wird über ogg + libopus dekodiert und als rodio-Source eingespeist.
 
 use anyhow::{Result, anyhow, bail};
-use rust_i18n::t;
 use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::source::SeekError;
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
+use rust_i18n::t;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -254,7 +254,11 @@ impl Audio {
             }
             Err(e) => {
                 log::error!("Kein Ausgabegerät nutzbar: {e:#}");
-                (None, None, Some(t!("audio.none_usable_err", e = format!("{e:#}")).to_string()))
+                (
+                    None,
+                    None,
+                    Some(t!("audio.none_usable_err", e = format!("{e:#}")).to_string()),
+                )
             }
         };
         Self {
@@ -370,7 +374,9 @@ impl Audio {
         // kann Opus nicht decodieren, daher die Weiche am Inhalt. Alles andere erkennt der
         // Standard-Decoder selbst (Feature `ogg`: Vorbis, FLAC; Speex wird nie unterstützt).
         let is_opus = ext == "opus"
-            || (cfg!(feature = "ogg") && matches!(ext.as_str(), "ogg" | "oga") && is_ogg_opus(path));
+            || (cfg!(feature = "ogg")
+                && matches!(ext.as_str(), "ogg" | "oga")
+                && is_ogg_opus(path));
         if is_opus {
             self.append_source(&sink, OpusSource::open(path)?, label);
         } else {
@@ -852,7 +858,10 @@ mod tests {
             analysis: None,
             startup_error: Some("Kein Ausgabegerät nutzbar: Test".into()),
         };
-        assert_eq!(audio.take_startup_error().as_deref(), Some("Kein Ausgabegerät nutzbar: Test"));
+        assert_eq!(
+            audio.take_startup_error().as_deref(),
+            Some("Kein Ausgabegerät nutzbar: Test")
+        );
         assert_eq!(audio.take_startup_error(), None, "einmalig");
 
         rust_i18n::set_locale("de"); // die Meldung wird übersetzt
@@ -899,14 +908,20 @@ mod tests {
         // nach „Gerät verschwunden“ wird dagegen wirklich neu geöffnet
         audio.lost.store(true, Ordering::Relaxed);
         let _ = audio.set_device(Some(&name));
-        assert!(!audio.take_device_lost(), "Flag gehört zum alten Strom und ist weg");
+        assert!(
+            !audio.take_device_lost(),
+            "Flag gehört zum alten Strom und ist weg"
+        );
     }
 
     /// Ogg-/FLAC-Dateien erzeugen (ffmpeg): (Dateiname, ffmpeg-Argumente).
     #[cfg(feature = "ogg")]
     fn ogg_samples(dir: &Path, ffmpeg: &Path) -> Vec<PathBuf> {
         let cases: [(&str, &[&str]); 4] = [
-            ("vorbis.ogg", &["-c:a", "vorbis", "-strict", "-2", "-f", "ogg"]),
+            (
+                "vorbis.ogg",
+                &["-c:a", "vorbis", "-strict", "-2", "-f", "ogg"],
+            ),
             ("flac_in_ogg.oga", &["-c:a", "flac", "-f", "ogg"]),
             ("native.flac", &["-c:a", "flac"]),
             ("opus_in.ogg", &["-c:a", "libopus", "-f", "ogg"]), // .ogg mit Opus-Inhalt
@@ -916,7 +931,17 @@ mod tests {
             .map(|(name, args)| {
                 let file = dir.join(name);
                 let ok = std::process::Command::new(ffmpeg)
-                    .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "6"])
+                    .args([
+                        "-nostdin",
+                        "-loglevel",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "anullsrc=r=48000:cl=stereo",
+                        "-t",
+                        "6",
+                    ])
                     .args(*args)
                     .arg(&file)
                     .status()
@@ -948,11 +973,18 @@ mod tests {
                 name.starts_with("opus_in"),
                 "{name}: Opus-Erkennung"
             );
-            audio.play(&file).unwrap_or_else(|e| panic!("{name}: play: {e:#}"));
+            audio
+                .play(&file)
+                .unwrap_or_else(|e| panic!("{name}: play: {e:#}"));
             assert!(audio.is_playing(), "{name}");
-            audio.seek(Duration::from_secs(3)).unwrap_or_else(|e| panic!("{name}: seek: {e:#}"));
+            audio
+                .seek(Duration::from_secs(3))
+                .unwrap_or_else(|e| panic!("{name}: seek: {e:#}"));
             let pos = audio.position().as_secs_f32();
-            assert!((2.0..4.5).contains(&pos), "{name}: Position {pos} s nach Spulen auf 3 s");
+            assert!(
+                (2.0..4.5).contains(&pos),
+                "{name}: Position {pos} s nach Spulen auf 3 s"
+            );
             audio.stop();
         }
         let _ = std::fs::remove_dir_all(dir);
