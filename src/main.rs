@@ -2172,7 +2172,7 @@ impl PlayerApp {
         container(col).center(Length::Fill).into()
     }
 
-    /// Schmale Buttonleiste links (wie die Kanalliste in Halloy).
+    /// Schmale Buttonleiste links.
     fn sidebar(&self) -> Element<'_, Message> {
         let entry = |glyph: &'static [u8], label: String, on_press: Message| {
             button(
@@ -2257,7 +2257,7 @@ impl PlayerApp {
             )
         ]
         .spacing(4)
-        .width(Length::Fixed(157.0))
+        .width(Length::Fixed(162.0))
         .into()
     }
 
