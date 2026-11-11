@@ -40,8 +40,6 @@ use musicbrainz::MbState;
 
 /// Datenbank im Datenverzeichnis des Users (Linux: ~/.local/share, macOS:
 /// ~/Library/Application Support – unter der Sandbox innerhalb des App-Containers).
-/// Der Musikordner wird nicht mehr im Code festgelegt, sondern beim ersten Start
-/// im Ordner-Dialog gewählt und in dieser Datenbank gespeichert (Tabelle `settings`).
 const DB_SUBPATH: &str = "fya/library.db";
 
 fn fmt_time(secs: u64) -> String {
@@ -85,6 +83,7 @@ fn main() -> anyhow::Result<()> {
     // Beim Start läuft die Ausgabe auf dem Systemstandard; danach wird nur noch auf
     // ausdrücklich gewählte Geräte gewechselt.
     let audio = Audio::new();
+    let saved = SavedWindow::load(&library);
 
     // iced ruft die Boot-Funktion genau einmal auf; so reichen wir die
     // bereits erzeugten Objekte hinein.
@@ -102,7 +101,7 @@ fn main() -> anyhow::Result<()> {
     .subscription(PlayerApp::subscription)
     .theme(|app: &PlayerApp| app.theme.clone())
     .default_font(Font::MONOSPACE)
-    .window(window_settings())
+    .window(window_settings(saved))
     .run()?;
     Ok(())
 }
@@ -241,10 +240,50 @@ fn set_colors(theme: &Theme) {
     }
 }
 
-fn window_settings() -> iced::window::Settings {
+/// Gespeicherte Fenstergröße (logische Pixel), Einstellung `window` = „w,h“.
+/// Die Position wird bewusst nicht gespeichert: nach einem Monitorwechsel könnte das
+/// Fenster sonst außerhalb des sichtbaren Bereichs liegen.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SavedWindow {
+    size: iced::Size,
+}
+
+impl SavedWindow {
+    const KEY: &'static str = "window";
+    const DEFAULT_SIZE: iced::Size = iced::Size::new(1000.0, 640.0);
+    const MIN_SIZE: f32 = 300.0;
+
+    fn load(library: &Library) -> Self {
+        library
+            .setting(Self::KEY)
+            .and_then(|s| Self::parse(&s))
+            .unwrap_or(Self {
+                size: Self::DEFAULT_SIZE,
+            })
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        let v: Vec<f32> = s
+            .split(',')
+            .map(|p| p.trim().parse::<f32>().ok().filter(|f| f.is_finite()))
+            .collect::<Option<_>>()?;
+        match v[..] {
+            [w, h] | [w, h, _, _] if w >= Self::MIN_SIZE && h >= Self::MIN_SIZE => Some(Self {
+                size: iced::Size::new(w, h),
+            }),
+            _ => None,
+        }
+    }
+
+    fn encode(&self) -> String {
+        format!("{},{}", self.size.width, self.size.height)
+    }
+}
+
+fn window_settings(saved: SavedWindow) -> iced::window::Settings {
     #[allow(unused_mut)]
     let mut settings = iced::window::Settings {
-        size: iced::Size::new(1000.0, 640.0),
+        size: saved.size,
         // Fenster-/Taskleisten-Icon (Linux/Windows; unter macOS kommt es aus dem App-Bundle)
         icon: iced::window::icon::from_file_data(APP_ICON, None).ok(),
         ..Default::default()
@@ -318,6 +357,10 @@ enum Message {
     /// Einstellungsdialog (modal) öffnen/schließen
     /// Trennlinie zwischen den Spalten gezogen
     PaneResized(pane_grid::ResizeEvent),
+    /// Fenster skaliert (für die gespeicherte Größe)
+    WindowResized(iced::Size),
+    /// Geänderte Oberflächen-Einstellungen in die DB schreiben
+    SaveUi,
     ShowView(View),
     SelectMbAlbum(usize),
     /// Album in der Compilations-Ansicht (None = alle)
@@ -498,6 +541,11 @@ struct PlayerApp {
     search_generation: Arc<AtomicU64>,
     /// Spaltenaufteilung (Künstler | Alben | Titel), per Maus verschiebbar
     columns: pane_grid::State<Column>,
+    /// Teilung Künstler | Alben
+    columns_ratio: f32,
+    window: SavedWindow,
+    /// Fenster, Teilung oder Lautstärke geändert, aber noch nicht gespeichert
+    ui_dirty: bool,
 
     artists: Vec<Artist>,
     albums: Vec<Album>,
@@ -681,6 +729,12 @@ impl PlayerApp {
         // Kein Ausgabegerät nutzbar: App startet trotzdem, die Statuszeile nennt den Grund
         let startup_error = audio.take_startup_error();
         let language = lang::detect(library.setting(lang::SETTING_KEY).as_deref());
+        let columns_ratio = library
+            .setting("columns_ratio")
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|r| (0.05..=0.95).contains(r))
+            .unwrap_or(0.25);
+        let window = SavedWindow::load(&library);
         let mut app = Self {
             library,
             db_path,
@@ -705,9 +759,12 @@ impl PlayerApp {
             search: String::new(),
             filter: None,
             search_generation: Arc::new(AtomicU64::new(0)),
+            columns_ratio,
+            window,
+            ui_dirty: false,
             columns: pane_grid::State::with_configuration(pane_grid::Configuration::Split {
                 axis: pane_grid::Axis::Vertical,
-                ratio: 0.25,
+                ratio: columns_ratio,
                 a: Box::new(pane_grid::Configuration::Pane(Column::Artists)),
                 b: Box::new(pane_grid::Configuration::Pane(Column::Albums)),
             }),
@@ -779,6 +836,13 @@ impl PlayerApp {
         app.analyze_bpm =
             cfg!(feature = "bpm") && app.library.setting("bpm_analyze").as_deref() == Some("1");
         app.audio.set_analyze_bpm(app.analyze_bpm);
+        if let Some(v) = app
+            .library
+            .setting("volume")
+            .and_then(|v| v.parse::<f32>().ok())
+        {
+            app.audio.set_volume(v);
+        }
         let task = app.restore_folder();
         (app, task)
     }
@@ -965,6 +1029,15 @@ impl PlayerApp {
         #[cfg_attr(not(feature = "controls"), allow(unused_mut))]
         let mut subscriptions = vec![ticker, keys, spinner];
 
+        // Fenstergröße mitschreiben; gespeichert wird gebündelt, nicht bei jedem Pixel
+        subscriptions.push(event::listen_with(|event, _status, _id| match event {
+            Event::Window(iced::window::Event::Resized(s)) => Some(Message::WindowResized(s)),
+            _ => None,
+        }));
+        if self.ui_dirty {
+            subscriptions.push(time::every(Duration::from_secs(1)).map(|_| Message::SaveUi));
+        }
+
         // Befehle des Betriebssystems (Medientasten …)
         #[cfg(feature = "controls")]
         subscriptions.push(Subscription::run(media_controls::commands).map(Message::Media));
@@ -1073,9 +1146,32 @@ impl PlayerApp {
                     }
                 }
             }
-            Message::Volume(v) => self.audio.set_volume(v),
+            Message::Volume(v) => {
+                self.audio.set_volume(v);
+                self.ui_dirty = true;
+            }
 
-            Message::PaneResized(e) => self.columns.resize(e.split, e.ratio),
+            Message::PaneResized(e) => {
+                self.columns.resize(e.split, e.ratio);
+                self.columns_ratio = e.ratio;
+                self.ui_dirty = true;
+            }
+            Message::WindowResized(s) => {
+                self.window.size = s;
+                self.ui_dirty = true;
+            }
+            Message::SaveUi => {
+                self.ui_dirty = false;
+                let lib = &self.library;
+                let results = [
+                    lib.set_setting(SavedWindow::KEY, &self.window.encode()),
+                    lib.set_setting("columns_ratio", &self.columns_ratio.to_string()),
+                    lib.set_setting("volume", &self.audio.volume().to_string()),
+                ];
+                for e in results.into_iter().filter_map(Result::err) {
+                    log::warn!("Einstellungen nicht gespeichert: {e}");
+                }
+            }
             Message::ShowView(view) => {
                 if view == View::Settings {
                     // ffmpeg könnte inzwischen installiert worden sein
@@ -3618,5 +3714,21 @@ mod keyboard_tests {
         let _ = app.update(Message::ShowViewKey(View::Help));
         assert_eq!(app.view, View::Help);
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::SavedWindow;
+
+    #[test]
+    fn saved_window_roundtrip() {
+        let w = SavedWindow::parse("1000,640").unwrap();
+        assert_eq!(SavedWindow::parse(&w.encode()), Some(w));
+        // altes Format mit Position
+        assert_eq!(SavedWindow::parse("1000,640,12.5,-30"), Some(w));
+        assert!(SavedWindow::parse("10,10").is_none());
+        assert!(SavedWindow::parse("a,b").is_none());
+        assert!(SavedWindow::parse("1000,640,5").is_none());
     }
 }
