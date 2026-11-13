@@ -600,11 +600,10 @@ struct PlayerApp {
     status: Option<String>,
 }
 
-/// Funktionstasten: F1 / Druck = Suche, F2–F7 = Tabs (Reihenfolge der Sidebar).
+/// Funktionstasten: F1–F6 = Tabs (Reihenfolge der Sidebar).
 fn function_key_message(key: keyboard::key::Named) -> Option<Message> {
     use keyboard::key::Named;
     Some(match key {
-        Named::Select => Message::FocusSearch,
         Named::F1 => Message::ShowViewKey(View::Music),
         Named::F2 => Message::ShowViewKey(View::Compilations),
         Named::F3 => Message::ShowViewKey(View::Playlists),
@@ -626,6 +625,17 @@ fn map_key(event: Event, status: event::Status, _window: iced::window::Id) -> Op
     {
         if let Some(message) = function_key_message(*named) {
             return Some(message);
+        }
+    }
+    // Cmd+F (macOS) / Strg+F = Suchfeld; ein Textfeld verarbeitet das nicht selbst
+    if let Event::Keyboard(keyboard::Event::KeyPressed {
+        key: keyboard::Key::Character(c),
+        modifiers,
+        ..
+    }) = &event
+    {
+        if c.as_str().eq_ignore_ascii_case("f") && modifiers.command() && !modifiers.alt() {
+            return Some(Message::FocusSearch);
         }
     }
     match (event, status) {
@@ -2621,7 +2631,7 @@ impl PlayerApp {
                 key("t".into(), t!("help.k.t").into()),
                 key("p".into(), t!("help.k.p").into()),
                 key(move_keys(), t!("help.k.move").into()),
-                key("Select".into(), t!("help.k.select").into()),
+                key(search_keys().into(), t!("help.k.select").into()),
                 key("F1 … F6".into(), t!("help.k.tabs").into()),
                 key(t!("help.k.tab_keys").into(), t!("help.k.tab").into()),
                 key("Enter".into(), t!("help.k.enter").into()),
@@ -3245,6 +3255,14 @@ const COMPILATIONS: &str = "Compilations";
 
 /// Tastenkombination zum Verschieben in der Playlist, wie sie die Hilfe nennt: Die Taste
 /// heißt auf dem Mac „Option“, sonst „Alt“ (dasselbe Modifier-Flag `alt`).
+fn search_keys() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Cmd + F"
+    } else {
+        "Ctrl + F"
+    }
+}
+
 fn move_keys() -> String {
     if cfg!(target_os = "macos") {
         "Option + ↑ / Option + ↓".into()
@@ -3513,7 +3531,10 @@ mod keyboard_tests {
     use keyboard::key::Named;
 
     fn press(named: Named, modifiers: keyboard::Modifiers) -> Event {
-        let key = keyboard::Key::Named(named);
+        press_key(keyboard::Key::Named(named), modifiers)
+    }
+
+    fn press_key(key: keyboard::Key, modifiers: keyboard::Modifiers) -> Event {
         Event::Keyboard(keyboard::Event::KeyPressed {
             key: key.clone(),
             modified_key: key,
@@ -3534,13 +3555,23 @@ mod keyboard_tests {
     #[test]
     fn funktionstasten_suche_und_tabs() {
         let none = keyboard::Modifiers::empty();
-        for key in [Named::Select] {
-            for status in [event::Status::Ignored, event::Status::Captured] {
-                assert!(
-                    matches!(map(key, none, status), Some(Message::FocusSearch)),
-                    "{key:?}"
-                );
-            }
+        // Cmd/Strg+F = Suche, auch wenn ein Textfeld die Taste gesehen hat
+        let f = || keyboard::Key::Character("f".into());
+        for status in [event::Status::Ignored, event::Status::Captured] {
+            let cmd = press_key(f(), keyboard::Modifiers::COMMAND);
+            assert!(matches!(
+                map_key(cmd, status, iced::window::Id::unique()),
+                Some(Message::FocusSearch)
+            ));
+        }
+        // ohne Modifier (Tippen im Suchfeld) oder mit Alt keine Suche
+        for m in [
+            none,
+            keyboard::Modifiers::COMMAND | keyboard::Modifiers::ALT,
+        ] {
+            let e = press_key(f(), m);
+            let r = map_key(e, event::Status::Ignored, iced::window::Id::unique());
+            assert!(!matches!(r, Some(Message::FocusSearch)));
         }
         // F1–F6: Tabs in der Reihenfolge der Sidebar
         let expected = [

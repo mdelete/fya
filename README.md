@@ -118,6 +118,7 @@ Wiedergabeliste. Die Hilfe-Seite (F6) in der App listet dasselbe.
 | Taste | Wirkung |
 |---|---|
 | Leertaste | Wiedergabe starten / pausieren |
+| Cmd + F (macOS) / Strg + F | Suchfeld fokussieren |
 | F1 … F6 | Tab wechseln: Music, Compilations, Playlists, MusicBrainz, Settings, Help |
 | Tab / Umschalt + Tab | Music / Compilations: nächster / vorheriger Künstler bzw. Album; in Dialogen nächstes / vorheriges Feld |
 | `t` | Tags des laufenden Titels bearbeiten (Music, Compilations, Playlists) |
