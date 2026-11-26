@@ -8,8 +8,8 @@ license = "MIT"
 iced = { version = "0.14", features = ["tokio", "svg", "image"] }
 tokio = { version = "1", features = ["rt", "sync"] }
 # Nativer Ordner-Dialog: macOS = NSOpenPanel, Linux = XDG Desktop Portal
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 lofty = "0.25"
 rodio = { version = "0.23", default-features = false, features = [
     "playback",
@@ -21,7 +21,7 @@ rodio = { version = "0.23", default-features = false, features = [
 ogg = "0.9"
 opus-rs = "0.1"
 anyhow = "1"
-dirs = "6"
+dirs = "7"
 ureq = { version = "3", features = ["json"] }
 serde_json = "1.0.154"
 log = "0.4.35"
